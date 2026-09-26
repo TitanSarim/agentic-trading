@@ -86,6 +86,8 @@ class RiskSettings(BaseModel):
 class ExecutionSettings(BaseModel):
     require_attached_stop: bool = True
     idempotent_client_order_ids: bool = True
+    # P6 demo-only. Flip only after Definition of Done (Phase 9).
+    allow_live: bool = False
 
 
 class DatabaseSettings(BaseModel):
@@ -99,6 +101,8 @@ class LoggingSettings(BaseModel):
 
 class BrokerSettings(BaseModel):
     backend: Literal["mock", "mt5"] = "mock"
+    # Alias for mt5.account_mode — demo is required for P6 submits.
+    mode: Literal["demo", "live"] = "demo"
 
 
 class StrategySettings(BaseModel):
@@ -229,11 +233,28 @@ def _env_overrides() -> dict[str, Any]:
     if level := os.environ.get("TRADER_LOG_LEVEL"):
         overrides["logging"] = {"level": level.upper()}
 
+    broker_ov: dict[str, Any] = {}
     if backend := os.environ.get("TRADER_BROKER_BACKEND"):
-        overrides["broker"] = {"backend": backend.lower()}
+        broker_ov["backend"] = backend.lower()
+    if broker_mode := os.environ.get("TRADER_BROKER_MODE"):
+        broker_ov["mode"] = broker_mode.lower()
+    if broker_ov:
+        overrides["broker"] = broker_ov
 
+    mt5_ov: dict[str, Any] = {}
     if mode := os.environ.get("TRADER_ACCOUNT_MODE"):
-        overrides["mt5"] = {"account_mode": mode.lower()}
+        mt5_ov["account_mode"] = mode.lower()
+        # Keep broker.mode in sync when only the legacy env is set.
+        overrides.setdefault("broker", {})
+        if isinstance(overrides["broker"], dict):
+            overrides["broker"].setdefault("mode", mode.lower())
+    if mt5_ov:
+        overrides["mt5"] = mt5_ov
+
+    if allow_live := os.environ.get("TRADER_ALLOW_LIVE"):
+        overrides["execution"] = {
+            "allow_live": allow_live.strip().lower() in ("1", "true", "yes"),
+        }
 
     return overrides
 
@@ -259,4 +280,13 @@ def load_settings(
     raw = _apply_provider_url_alias(_load_yaml(path))
     merged = _deep_merge(raw, _env_overrides())
     settings = Settings.model_validate(merged)
-    return settings.model_copy(update={"config_path": str(path)})
+    # Keep broker.mode and mt5.account_mode aligned (broker.mode wins if both set).
+    mode = settings.broker.mode or settings.mt5.account_mode
+    settings = settings.model_copy(
+        update={
+            "config_path": str(path),
+            "broker": settings.broker.model_copy(update={"mode": mode}),
+            "mt5": settings.mt5.model_copy(update={"account_mode": mode}),
+        }
+    )
+    return settings

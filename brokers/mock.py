@@ -23,17 +23,25 @@ class MockBroker:
         balance: float = 1000.0,
         account_mode: str = "demo",
         fill_orders: bool = True,
+        require_take_profit: bool = True,
+        allow_live: bool = False,
     ) -> None:
         self._balance = balance
         self._equity = balance
         self._account_mode = account_mode  # type: ignore[assignment]
         self._connected = False
         self._fill_orders = fill_orders
+        self._require_take_profit = require_take_profit
+        self._allow_live = allow_live
         self._positions: dict[str, Position] = {}
         self._orders: dict[str, OrderResult] = {}
         self._ticket_seq = 1000
 
     def connect(self) -> None:
+        if self._account_mode == "live" and not self._allow_live:
+            raise RuntimeError(
+                "MockBroker refuse connect: account_mode=live requires allow_live"
+            )
         self._connected = True
 
     def disconnect(self) -> None:
@@ -55,8 +63,21 @@ class MockBroker:
         self._require_connected()
         return list(self._positions.values())
 
+    def inject_position(self, position: Position) -> None:
+        """Test helper: simulate an unexpected broker position."""
+        self._positions[position.ticket] = position
+
     def submit_order(self, request: OrderRequest) -> OrderResult:
         self._require_connected()
+        if self._account_mode == "live" and not self._allow_live:
+            result = OrderResult(
+                client_order_id=request.client_order_id,
+                status=OrderStatus.REJECTED,
+                message="live trading disabled (allow_live=false)",
+            )
+            self._orders[request.client_order_id] = result
+            return result
+
         if request.client_order_id in self._orders:
             return self._orders[request.client_order_id]
 
@@ -65,6 +86,15 @@ class MockBroker:
                 client_order_id=request.client_order_id,
                 status=OrderStatus.REJECTED,
                 message="stop_loss required",
+            )
+            self._orders[request.client_order_id] = result
+            return result
+
+        if self._require_take_profit and request.take_profit is None:
+            result = OrderResult(
+                client_order_id=request.client_order_id,
+                status=OrderStatus.REJECTED,
+                message="take_profit required",
             )
             self._orders[request.client_order_id] = result
             return result
@@ -80,7 +110,7 @@ class MockBroker:
 
         self._ticket_seq += 1
         ticket = str(self._ticket_seq)
-        # Synthetic fill near stop — mock has no live quotes.
+        # Synthetic fill near entry zone — mock has no live quotes.
         fill_price = request.stop_loss + (
             0.001 if request.side.value == "BUY" else -0.001
         )
@@ -110,7 +140,6 @@ class MockBroker:
         self._require_connected()
         existing = self._orders.get(client_order_id)
         if existing and existing.status == OrderStatus.FILLED:
-            # Close matching position if present.
             to_remove = [
                 t
                 for t, p in self._positions.items()

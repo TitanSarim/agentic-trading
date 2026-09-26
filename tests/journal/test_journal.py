@@ -15,6 +15,7 @@ def test_migrate_and_system_events(tmp_path: Path) -> None:
     assert 1 in applied
     assert 2 in applied
     assert 3 in applied
+    assert 4 in applied
     # Idempotent
     assert db.migrate() == []
 

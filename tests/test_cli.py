@@ -28,7 +28,7 @@ def test_health_and_demo_roundtrip(tmp_path: Path, monkeypatch) -> None:
     health = runner.invoke(app, ["health"])
     assert health.exit_code == 0
     assert "health ok" in health.stdout
-    assert "Phase 5" in health.stdout
+    assert "Phase 6" in health.stdout
 
     demo = runner.invoke(app, ["demo-roundtrip"])
     assert demo.exit_code == 0
@@ -77,3 +77,47 @@ def test_health_and_demo_roundtrip(tmp_path: Path, monkeypatch) -> None:
         ],
     )
     assert scan_analyze.exit_code == 0
+
+    dry = runner.invoke(
+        app,
+        [
+            "execute-demo",
+            "--backend",
+            "mock",
+            "--dry-run",
+            "--mock-llm",
+            "--symbol",
+            "EURUSD",
+            "--timeframe",
+            "M5",
+            "--json",
+        ],
+    )
+    assert dry.exit_code == 0
+    assert "dry-run" in dry.stdout
+
+    # --submit without --confirm-demo must fail
+    bad = runner.invoke(
+        app,
+        ["execute-demo", "--backend", "mock", "--submit", "--mock-llm", "--json"],
+    )
+    assert bad.exit_code == 1
+
+    submit = runner.invoke(
+        app,
+        [
+            "execute-demo",
+            "--backend",
+            "mock",
+            "--submit",
+            "--confirm-demo",
+            "--mock-llm",
+            "--symbol",
+            "EURUSD",
+            "--timeframe",
+            "M5",
+            "--json",
+        ],
+    )
+    assert submit.exit_code == 0
+    assert "submit" in submit.stdout or "FILLED" in submit.stdout

@@ -1,7 +1,7 @@
 [project]
 name = "agentic-trading"
 version = "0.1.0"
-description = "Autonomous Qwen + Ollama + MT5 trading system (Phase 5 Qwen/Ollama)"
+description = "Autonomous Qwen + Ollama + MT5 trading system (Phase 6 demo execution)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -17,8 +17,8 @@ dependencies = [
 
 [project.optional-dependencies]
 mt5 = [
-    # Windows only — install on the MT5 host: pip install MetaTrader5
-    # "MetaTrader5>=5.0.45",
+    # Windows only — install on the MT5 host next to terminal64.exe
+    "MetaTrader5>=5.0.45; platform_system=='Windows'",
 ]
 dev = [
     "pytest>=8.2",

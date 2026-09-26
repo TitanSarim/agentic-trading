@@ -11,7 +11,10 @@ from trading.types import (
     AccountState,
     AnalystDecision,
     Bar,
+    OrderResult,
+    Position,
     RiskDecision,
+    Side,
     TradeCandidate,
     utc_now,
 )
@@ -269,6 +272,206 @@ class JournalDB:
         )
         self._conn.commit()
         return int(cur.lastrowid)
+
+    def record_order(
+        self,
+        *,
+        client_order_id: str,
+        symbol: str,
+        side: str,
+        volume: float,
+        status: str,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+        broker_ticket: str | None = None,
+        fill_price: float | None = None,
+        message: str = "",
+        dry_run: bool = False,
+        account_mode: str = "demo",
+        candidate_id: int | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> int:
+        cur = self._conn.execute(
+            """
+            INSERT INTO orders(
+                created_at, client_order_id, candidate_id, symbol, side, volume,
+                stop_loss, take_profit, status, broker_ticket, fill_price, message,
+                dry_run, account_mode, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(client_order_id) DO UPDATE SET
+                status=excluded.status,
+                broker_ticket=COALESCE(excluded.broker_ticket, orders.broker_ticket),
+                fill_price=COALESCE(excluded.fill_price, orders.fill_price),
+                message=excluded.message,
+                dry_run=excluded.dry_run,
+                payload_json=excluded.payload_json
+            """,
+            (
+                utc_now().isoformat(),
+                client_order_id,
+                candidate_id,
+                symbol,
+                side,
+                volume,
+                stop_loss,
+                take_profit,
+                status,
+                broker_ticket,
+                fill_price,
+                message,
+                1 if dry_run else 0,
+                account_mode,
+                json.dumps(payload or {}),
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def record_order_result(
+        self,
+        order: OrderResult,
+        *,
+        symbol: str,
+        side: str,
+        volume: float,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+        dry_run: bool = False,
+        account_mode: str = "demo",
+        candidate_id: int | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> int:
+        oid = self.record_order(
+            client_order_id=order.client_order_id,
+            symbol=symbol,
+            side=side,
+            volume=volume,
+            status=order.status.value,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            broker_ticket=order.broker_ticket,
+            fill_price=order.fill_price,
+            message=order.message,
+            dry_run=dry_run,
+            account_mode=account_mode,
+            candidate_id=candidate_id,
+            payload=payload,
+        )
+        if (
+            not dry_run
+            and order.status.value == "FILLED"
+            and order.fill_price is not None
+            and order.broker_ticket
+        ):
+            self.record_fill(
+                client_order_id=order.client_order_id,
+                broker_ticket=order.broker_ticket,
+                symbol=symbol,
+                side=side,
+                volume=volume,
+                fill_price=order.fill_price,
+            )
+            self.upsert_position(
+                Position(
+                    ticket=order.broker_ticket,
+                    symbol=symbol,
+                    side=Side(side) if not isinstance(side, Side) else side,
+                    volume=volume,
+                    entry_price=order.fill_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    client_order_id=order.client_order_id,
+                )
+            )
+        return oid
+
+    def record_fill(
+        self,
+        *,
+        client_order_id: str,
+        broker_ticket: str | None,
+        symbol: str,
+        side: str,
+        volume: float,
+        fill_price: float,
+        payload: dict[str, Any] | None = None,
+    ) -> int:
+        cur = self._conn.execute(
+            """
+            INSERT INTO fills(
+                created_at, client_order_id, broker_ticket, symbol, side,
+                volume, fill_price, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                utc_now().isoformat(),
+                client_order_id,
+                broker_ticket,
+                symbol,
+                side,
+                volume,
+                fill_price,
+                json.dumps(payload or {}),
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def upsert_position(self, position: Position, *, status: str = "open") -> None:
+        now = utc_now().isoformat()
+        self._conn.execute(
+            """
+            INSERT INTO positions_journal(
+                ticket, created_at, updated_at, client_order_id, symbol, side,
+                volume, entry_price, stop_loss, take_profit, profit, status, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ticket) DO UPDATE SET
+                updated_at=excluded.updated_at,
+                volume=excluded.volume,
+                stop_loss=excluded.stop_loss,
+                take_profit=excluded.take_profit,
+                profit=excluded.profit,
+                status=excluded.status,
+                payload_json=excluded.payload_json
+            """,
+            (
+                position.ticket,
+                now,
+                now,
+                position.client_order_id,
+                position.symbol,
+                position.side.value if hasattr(position.side, "value") else str(position.side),
+                position.volume,
+                position.entry_price,
+                position.stop_loss,
+                position.take_profit,
+                position.profit,
+                status,
+                position.model_dump_json(),
+            ),
+        )
+        self._conn.commit()
+
+    def mark_position_closed(self, ticket: str) -> None:
+        self._conn.execute(
+            """
+            UPDATE positions_journal
+            SET status='closed', updated_at=?
+            WHERE ticket=?
+            """,
+            (utc_now().isoformat(), ticket),
+        )
+        self._conn.commit()
+
+    def open_position_tickets(self) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT ticket FROM positions_journal WHERE status='open'"
+        ).fetchall()
+        return {str(r["ticket"]) for r in rows}
+
+    def count_orders(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) FROM orders").fetchone()
+        return int(row[0])
 
     def recent_system_events(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self._conn.execute(
