@@ -92,6 +92,8 @@ class TradeCandidate(BaseModel):
 
 
 class AnalystDecision(BaseModel):
+    """Qwen analyst output — advisory only; risk_modifier may only reduce size."""
+
     decision: Literal["APPROVE", "REJECT"]
     confidence: float = Field(ge=0.0, le=1.0)
     risk_modifier: float = Field(ge=0.0, le=1.0, default=1.0)
@@ -99,6 +101,8 @@ class AnalystDecision(BaseModel):
     raw_response: str | None = None
     model: str | None = None
     prompt_version: str | None = None
+    input_hash: str | None = None
+    validated_response: dict | None = None
 
 
 class RiskDecision(BaseModel):

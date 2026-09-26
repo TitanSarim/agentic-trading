@@ -1,6 +1,7 @@
-"""Trader CLI — health, migrate, download-bars, backtest, scan, ollama-tags.
+"""Trader CLI — health, migrate, download-bars, backtest, scan, analyze, ollama-tags.
 
-No live order placement. Backtests/scans are offline (mock/sample bars only).
+No live order placement. Backtests/scans/analyze-mock are offline (cloud-safe).
+Live Ollama calls are optional and skippable without LAN.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from trading.data.historical import HistoricalDownloader
 from trading.data.mock import MockMarketData
 from trading.journal.db import JournalDB
 from trading.llm.factory import create_llm
+from trading.llm.pipeline import analyze_candidates
 from trading.logging_setup import configure_logging, get_logger
 from trading.risk.engine import RiskEngine
 from trading.scanner import (
@@ -34,7 +36,7 @@ from trading.types import Timeframe
 
 app = typer.Typer(
     name="trader",
-    help="Agentic trading CLI (Phase 4 scanner). No live trades.",
+    help="Agentic trading CLI (Phase 5 Qwen/Ollama). No live trades.",
     add_completion=False,
 )
 console = Console()
@@ -82,30 +84,35 @@ def health(ctx: typer.Context) -> None:
     console.print(f"[bold]config[/bold]: {settings.config_path}")
     console.print(f"[bold]ollama.base_url[/bold]: {settings.ollama.base_url}")
     console.print(f"[bold]analyst_model[/bold]: {settings.ollama.analyst_model}")
-    console.print(f"[bold]universe[/bold]: {settings.universe.symbols} @ {settings.universe.timeframes}")
+    console.print(f"[bold]ollama.backend[/bold]: {settings.ollama.backend}")
+    console.print(
+        f"[bold]universe[/bold]: {settings.universe.symbols} @ {settings.universe.timeframes}"
+    )
     console.print(f"[bold]broker.backend[/bold]: {settings.broker.backend}")
     console.print(f"[bold]account_mode[/bold]: {settings.mt5.account_mode}")
 
-    # DB migrate + event
     db = JournalDB(settings.database.path)
     applied = db.migrate()
     db.record_system_event("health_check", {"applied_migrations": applied})
-    console.print(f"[bold]database[/bold]: {settings.database.path} (migrations={applied or 'up-to-date'})")
+    console.print(
+        f"[bold]database[/bold]: {settings.database.path} "
+        f"(migrations={applied or 'up-to-date'})"
+    )
 
-    # Broker
     broker = create_broker(settings)
     try:
         if settings.broker.backend == "mt5":
             console.print(
-                "[yellow]broker[/yellow]: mt5 selected — connect requires Windows + MetaTrader5; "
-                "skipping live connect in health (use mock in CI)"
+                "[yellow]broker[/yellow]: mt5 selected — connect requires Windows + "
+                "MetaTrader5; skipping live connect in health (use mock in CI)"
             )
         else:
             broker.connect()
             account = broker.account_state()
             db.record_account_snapshot(account)
             console.print(
-                f"[bold]broker[/bold]: mock connected equity={account.equity} mode={account.account_mode}"
+                f"[bold]broker[/bold]: mock connected equity={account.equity} "
+                f"mode={account.account_mode}"
             )
             broker.disconnect()
     except Exception as exc:  # noqa: BLE001 — surface health failure
@@ -113,7 +120,6 @@ def health(ctx: typer.Context) -> None:
         console.print(f"[red]broker[/red]: {exc}")
         log.exception("broker_health_failed")
 
-    # Risk engine boots (boss; LLM cannot raise caps)
     RiskEngine(settings.risk)
     console.print(
         "[bold]risk[/bold]: engine loaded "
@@ -125,16 +131,21 @@ def health(ctx: typer.Context) -> None:
         f"[bold]scanner[/bold]: top_n={settings.scanner.top_n} "
         "(score ranks only — RiskEngine still must approve)"
     )
+    console.print(
+        f"[bold]llm[/bold]: analyst={settings.ollama.analyst_model} "
+        f"fail_closed={settings.ollama.fail_closed_on_error} "
+        "(risk_modifier may only reduce size)"
+    )
 
-    # Ollama optional — fail soft in health (cloud cannot reach .22)
     llm = create_llm(settings)
     reachable = llm.health()
     if reachable:
         console.print(f"[green]ollama[/green]: reachable at {settings.ollama.base_url}")
     else:
         console.print(
-            f"[yellow]ollama[/yellow]: not reachable from this host ({settings.ollama.base_url}). "
-            "Expected on Windows LAN; cloud CI should skip live Ollama."
+            f"[yellow]ollama[/yellow]: not reachable from this host "
+            f"({settings.ollama.base_url}). Expected on Windows LAN; "
+            "cloud CI should skip live Ollama."
         )
 
     db.record_system_event(
@@ -145,14 +156,14 @@ def health(ctx: typer.Context) -> None:
 
     if not ok:
         raise typer.Exit(code=1)
-    console.print("[green]health ok[/green] (Phase 4 scanner)")
+    console.print("[green]health ok[/green] (Phase 5 Qwen/Ollama)")
 
 
 @app.command("ollama-tags")
 def ollama_tags(ctx: typer.Context) -> None:
     """List Ollama models when URL is reachable; exit 2 if unreachable (skip in CI)."""
     settings = ctx.obj["settings"]
-    llm = create_llm(settings)
+    llm = create_llm(settings, force_mock=False, backend="ollama")
     if not llm.health():
         console.print(
             f"[yellow]Ollama unreachable[/yellow] at {settings.ollama.base_url}. "
@@ -160,7 +171,9 @@ def ollama_tags(ctx: typer.Context) -> None:
         )
         raise typer.Exit(code=2)
     models = llm.list_models()
-    console.print(json.dumps({"base_url": settings.ollama.base_url, "models": models}, indent=2))
+    console.print(
+        json.dumps({"base_url": settings.ollama.base_url, "models": models}, indent=2)
+    )
     expected = {settings.ollama.analyst_model, settings.ollama.screen_model}
     missing = [m for m in expected if not any(m in name for name in models)]
     if missing:
@@ -192,7 +205,8 @@ def download_bars(
     settings = ctx.obj["settings"]
     if not use_mock:
         console.print(
-            "[yellow]Live MT5 bar download not implemented in Phase 1 — using mock data.[/yellow]"
+            "[yellow]Live MT5 bar download not implemented in Phase 1 — "
+            "using mock data.[/yellow]"
         )
     db = JournalDB(settings.database.path)
     db.migrate()
@@ -223,7 +237,6 @@ def demo_roundtrip(ctx: typer.Context) -> None:
     broker.connect()
     account = broker.account_state()
 
-    # Prefer a real strategy candidate when synthetic bars allow; else stub.
     market = MockMarketData(scenario="trend_pullback")
     bars = market.get_bars("EURUSD", Timeframe.M5, count=120)
     strategy = TrendPullbackStrategy(_strategy_cfg(settings))
@@ -293,7 +306,7 @@ def demo_roundtrip(ctx: typer.Context) -> None:
             volume=decision.volume,
             stop_loss=candidate.stop,
             take_profit=candidate.target,
-            client_order_id=f"p3-demo-{cid}",
+            client_order_id=f"p5-demo-{cid}",
         )
         result = broker.submit_order(order)
 
@@ -317,6 +330,105 @@ def demo_roundtrip(ctx: typer.Context) -> None:
             "order": result.model_dump() if result else None,
         }
     )
+
+
+@app.command("analyze")
+def analyze(
+    ctx: typer.Context,
+    symbol: str = typer.Option("EURUSD", "--symbol", "-s"),
+    timeframe: str = typer.Option("M5", "--timeframe", "-t"),
+    bars: int = typer.Option(120, "--bars", "-n"),
+    live: bool = typer.Option(
+        False,
+        "--live/--mock",
+        help="--live calls Ollama on LAN; default --mock is offline/CI-safe",
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable JSON"),
+) -> None:
+    """Dry analyst call on a strategy candidate (no orders).
+
+    Default uses MockLlm (cloud-safe). Pass ``--live`` on Windows LAN to hit
+    Ollama at OLLAMA_BASE_URL / config default. Exit 2 if --live and unreachable.
+    """
+    settings = ctx.obj["settings"]
+    if timeframe not in ("M5", "M15"):
+        console.print("[red]timeframe must be M5 or M15[/red]")
+        raise typer.Exit(code=1)
+
+    from trading.types import TradeCandidate
+
+    market = MockMarketData(scenario=settings.scanner.scenario)
+    tf = Timeframe(timeframe)
+    series = market.get_bars(symbol, tf, count=bars)
+    strategy = TrendPullbackStrategy(_strategy_cfg(settings))
+    candidate = None
+    for i in range(len(series) - 1, 20, -1):
+        candidate = strategy.evaluate(symbol, series, at_index=i)
+        if candidate is not None:
+            break
+    if candidate is None:
+        candidate = TradeCandidate(
+            symbol=symbol,
+            strategy=settings.strategy.name,
+            direction="LONG",
+            entry=1.1000,
+            stop=1.0980,
+            target=1.1040,
+            risk_reward=2.0,
+            regime="trend",
+            setup_score=75,
+        )
+
+    llm = create_llm(settings, force_mock=not live)
+    if live and not llm.health():
+        console.print(
+            f"[yellow]Ollama unreachable[/yellow] at {settings.ollama.base_url}. "
+            "Skip --live without LAN; use default --mock for offline tests."
+        )
+        raise typer.Exit(code=2)
+
+    market_context = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "bars": bars,
+        "last_close": series[-1].close if series else None,
+        "spread": series[-1].spread if series else None,
+    }
+    analyst = llm.validate_candidate(candidate, market_context=market_context)
+
+    db = JournalDB(settings.database.path)
+    db.migrate()
+    cid = db.record_candidate(candidate)
+    lid = db.record_llm_decision(analyst, candidate_id=cid)
+    payload = {
+        "mode": "live" if live else "mock",
+        "base_url": settings.ollama.base_url,
+        "analyst_model": settings.ollama.analyst_model,
+        "candidate_id": cid,
+        "llm_decision_id": lid,
+        "candidate": candidate.model_dump(mode="json"),
+        "analyst": analyst.model_dump(mode="json"),
+        "note": (
+            "Advisory only — RiskEngine must still approve; "
+            "risk_modifier may only reduce size. No orders placed."
+        ),
+    }
+    db.record_system_event("analyze_complete", payload)
+    db.close()
+
+    if json_out:
+        console.print_json(data=payload)
+    else:
+        console.print(
+            f"[bold]analyze[/bold] mode={'live' if live else 'mock'} "
+            f"model={analyst.model} decision={analyst.decision} "
+            f"modifier={analyst.risk_modifier} reason={analyst.reason_code}"
+        )
+        console.print(payload)
+        console.print(
+            "[dim]Fail-closed on timeout/bad JSON. "
+            "RiskEngine remains boss. No live orders.[/dim]"
+        )
 
 
 @app.command("backtest")
@@ -454,6 +566,16 @@ def scan(
         "--lock-risk",
         help="Simulate risk lock (all markets ineligible) — fail-closed demo",
     ),
+    do_analyze: bool = typer.Option(
+        False,
+        "--analyze/--no-analyze",
+        help="Run mock/config LLM on strategy candidates (advisory; no orders)",
+    ),
+    live_llm: bool = typer.Option(
+        False,
+        "--live-llm/--mock-llm",
+        help="With --analyze: call real Ollama (LAN). Default mock is CI-safe.",
+    ),
     json_out: bool = typer.Option(
         False,
         "--json",
@@ -472,11 +594,10 @@ def scan(
 
     symbols = [symbol] if symbol else list(settings.universe.symbols)
     timeframes = (
-        [timeframe]
-        if timeframe
-        else list(settings.universe.timeframes)
+        [timeframe] if timeframe else list(settings.universe.timeframes)
     )
     count = bars or settings.scanner.default_bars
+    run_analyze = do_analyze or settings.scanner.analyze_candidates
 
     scanner_settings = settings.scanner.model_copy(
         update={"top_n": top_n} if top_n is not None else {}
@@ -491,7 +612,6 @@ def scan(
     )
     from datetime import datetime, timedelta, timezone
 
-    # Align every series so the last bar shares one as-of clock (multi-TF offline).
     as_of = datetime(2024, 6, 1, 12, 0, tzinfo=timezone.utc)
     snapshots: list[MarketSnapshot] = []
     for sym in symbols:
@@ -530,12 +650,39 @@ def scan(
     db = JournalDB(settings.database.path)
     db.migrate()
     score_ids = db.record_scan_report(report)
-    # Journal strategy candidates when present — still no orders.
+    candidate_ids: list[int] = []
+    candidates = []
     for row in report.selected:
         if row.candidate is not None:
-            db.record_candidate(row.candidate)
+            candidate_ids.append(db.record_candidate(row.candidate))
+            candidates.append(row.candidate)
+
+    analyzed_payload = None
+    if run_analyze and candidates:
+        llm = create_llm(settings, force_mock=not live_llm)
+        if live_llm and not llm.health():
+            console.print(
+                f"[yellow]Ollama unreachable[/yellow] at {settings.ollama.base_url} — "
+                "skipping live analyze; use --mock-llm."
+            )
+            raise typer.Exit(code=2)
+        analyzed = analyze_candidates(llm, candidates)
+        llm_ids = []
+        for analyzed_row, cid in zip(analyzed, candidate_ids, strict=False):
+            llm_ids.append(
+                db.record_llm_decision(analyzed_row.analyst, candidate_id=cid)
+            )
+        analyzed_payload = {
+            "mode": "live" if live_llm else "mock",
+            "llm_decision_ids": llm_ids,
+            "results": [a.to_dict() for a in analyzed],
+        }
+
     payload = report.to_dict()
     payload["score_row_ids"] = score_ids
+    payload["candidate_ids"] = candidate_ids
+    if analyzed_payload is not None:
+        payload["analyst"] = analyzed_payload
     db.record_system_event("scan_complete", payload)
     db.close()
 
@@ -564,6 +711,14 @@ def scan(
                 f"  #{row.rank} {row.symbol} {row.timeframe.value} "
                 f"score={row.opportunity_score:.2f} regime={row.regime}{cand}"
             )
+        if analyzed_payload is not None:
+            console.print("[bold]analyst (advisory)[/bold]:")
+            for item in analyzed_payload["results"]:
+                a = item["analyst"]
+                console.print(
+                    f"  {item['candidate']['symbol']} → {a['decision']} "
+                    f"modifier={a['risk_modifier']} reason={a['reason_code']}"
+                )
         console.print("[bold]all markets[/bold]:")
         for row in report.markets:
             flag = "OK" if row.eligible else row.reason_code

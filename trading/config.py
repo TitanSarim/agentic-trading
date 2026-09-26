@@ -26,6 +26,10 @@ class OllamaSettings(BaseModel):
     temperature: float = 0.1
     timeout_seconds: float = 30.0
     fail_closed_on_error: bool = True
+    # ollama = real HTTP client; mock = offline (CI / cloud).
+    backend: Literal["ollama", "mock"] = "ollama"
+    # Optional fast 9b screen before primary analyst.
+    use_screen_model: bool = False
 
 
 class Mt5Settings(BaseModel):
@@ -148,6 +152,8 @@ class ScannerSettings(BaseModel):
     default_bars: int = 120
     scenario: Literal["flat", "trend_pullback"] = "trend_pullback"
     evaluate_strategy: bool = True
+    # Phase 5: optionally run Qwen/mock analyst on strategy candidates (no orders).
+    analyze_candidates: bool = False
 
 
 class Settings(BaseModel):
@@ -212,6 +218,8 @@ def _env_overrides() -> dict[str, Any]:
         ollama["analyst_model"] = model
     if screen := os.environ.get("OLLAMA_SCREEN_MODEL"):
         ollama["screen_model"] = screen
+    if backend := os.environ.get("OLLAMA_BACKEND"):
+        ollama["backend"] = backend.lower()
     if ollama:
         overrides["ollama"] = ollama
 

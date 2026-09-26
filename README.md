@@ -1,12 +1,12 @@
-# Agentic Trading — Phase 4 Scanner
+# Agentic Trading — Phase 5 Qwen / Ollama
 
 Python trading-app scaffold for the Autonomous Qwen + Ollama + MT5 (IC Markets) system.
 
-**Authority:** Risk engine = boss. Qwen = analyst only. Strategy = setup generator. Scanner = rank only. Broker = executor.
+**Authority:** Risk engine = boss. Qwen = analyst only. Strategy = setup generator. Broker = executor.
 
 **Host:** Windows machine co-located with MT5. Models live on Linux `192.168.8.22` Ollama.
 
-Phase 4 adds the **market scanner**: eligibility gates + deterministic opportunity ranking for the V1 universe on `M5`/`M15`. **Score never alone opens a trade** — candidates must still pass RiskEngine. **No live trades.**
+Phase 5 wires the **Qwen analyst** against Ollama with strict JSON schema, timeouts, fail-closed rejects, and journaled decisions. `risk_modifier` may **only reduce** size. **No live trades.**
 
 ## Quick start (Windows)
 
@@ -16,7 +16,7 @@ cd path\to\agentic-trading
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-# or: uv sync  (if uv is installed)
+# or: uv sync
 
 copy .env.example .env
 
@@ -24,12 +24,14 @@ trader health
 trader config-print
 trader migrate
 trader download-bars --count 100
-trader scan
 trader backtest --symbol EURUSD --timeframe M5 --bars 400
+trader scan --symbol EURUSD --timeframe M5
+trader analyze --mock --json
 trader demo-roundtrip
 
 # Optional — only when this Windows host can reach .22:
 trader ollama-tags
+trader analyze --live --json
 curl -s http://192.168.8.22:11434/api/tags
 ```
 
@@ -38,36 +40,32 @@ With `uv`:
 ```powershell
 uv sync
 uv run trader health
-uv run trader scan --json
-uv run trader backtest --symbol EURUSD -t M5 -n 400
+uv run trader analyze --mock --json
 uv run pytest
 ```
 
-## Scanner (offline)
+## Offline tests (CI / cloud)
 
 ```powershell
-# Rank full V1 universe on M5 + M15 (synthetic bars)
-trader scan
+pip install -e ".[dev]"
+pytest
+# or: uv run pytest
 
-# One symbol / timeframe
-trader scan --symbol EURUSD --timeframe M5 --bars 120
-
-# Machine-readable + top-N override
-trader scan --top-n 2 --json
-
-# Fail-closed demo: risk lock → all markets ineligible
-trader scan --lock-risk
+trader analyze --mock --json
+trader scan --symbol EURUSD -t M5 --analyze --mock-llm --json
 ```
 
-Opportunity score components (rank only):
+All default tests mock the LLM — no LAN/Ollama/MT5 required.
 
-```text
-opportunity_score =
-  trend + volatility + momentum + setup_quality + liquidity
-  - spread_penalty - abnormal_volatility_penalty - correlation_penalty
+## Optional live Ollama (Windows LAN only)
+
+```powershell
+$env:OLLAMA_BASE_URL = "http://192.168.8.22:11434"
+trader ollama-tags
+trader analyze --live --symbol EURUSD --timeframe M5 --json
 ```
 
-Top-N rows may optionally emit a `trend_pullback_v1` candidate for inspection. That candidate is **not** sized or sent — RiskEngine remains required.
+Cloud Cursor agents **cannot** reach `192.168.8.22`. Exit code `2` from `ollama-tags` / `analyze --live` means unreachable — skippable without LAN.
 
 ## Configuration
 
@@ -77,16 +75,16 @@ Resolution order: **built-in defaults < `config/default.yaml` < environment** (e
 |-----------|---------|--------|
 | `OLLAMA_BASE_URL` / `ollama.base_url` / `provider_url` | `http://192.168.8.22:11434` | Env preferred for overrides |
 | `ollama.analyst_model` | `qwen3.8:27b` | Locked primary |
+| `ollama.screen_model` | `qwen3.5:9b` | Optional screener |
+| `ollama.use_screen_model` | `false` | Optional 9b pre-screen |
+| `ollama.backend` / `OLLAMA_BACKEND` | `ollama` | Use `mock` in CI |
+| `ollama.timeout_seconds` | `30` | Fail-closed on timeout |
+| `ollama.fail_closed_on_error` | `true` | Errors → REJECT / no boost |
+| `scanner.analyze_candidates` | `false` | Optional analyze after scan |
 | `universe.timeframes` | `M5`, `M15` | Locked |
-| `universe.symbols` | EURUSD, GBPUSD, USDJPY, XAUUSD | V1 max 4 |
-| `scanner.top_n` | `3` | Only top-N enter strategy eval |
-| `scanner.min_bars` | `64` | Eligibility |
-| `scanner.max_data_age_seconds` | `300` | Stale → ineligible |
-| `scanner.max_spread_pips` | `3.0` | Wide spread → ineligible |
-| `scanner.correlation_penalty` | `12.0` | Soft rank penalty in correlated groups |
-| `risk.*` | (see YAML) | Hard gates; LLM cannot raise caps |
-| `broker.backend` / `TRADER_BROKER_BACKEND` | `mock` | Use `mt5` only on Windows with MetaTrader5 |
-| `mt5.account_mode` | `demo` | Live only after plan Definition of Done |
+| `risk.allow_llm_increase_risk` | `false` | Hard-locked |
+| `broker.backend` / `TRADER_BROKER_BACKEND` | `mock` | `mt5` only on Windows |
+| `mt5.account_mode` | `demo` | Live only after Definition of Done |
 
 ## Topology
 
@@ -95,24 +93,21 @@ Windows: trading app + MT5 terminal64.exe
     --HTTP-->  http://192.168.8.22:11434  (Ollama + Qwen)
 
 Cloud Cursor agents cannot reach .22 or MT5.
-Use mocks in CI; run ollama-tags / MT5 checks on the Windows LAN host.
+Use mocks in CI; run ollama-tags / analyze --live on the Windows LAN host.
 ```
-
-MT5 path (locked):
-
-`C:\Program Files\MetaTrader 5 IC Markets Global\terminal64.exe`
 
 ## CLI
 
 | Command | Purpose |
 |---------|---------|
-| `trader health` | Config, DB migrate, mock broker, risk + scanner boot, optional Ollama ping |
+| `trader health` | Config, DB, mock broker, optional Ollama ping |
 | `trader config-print` | Dump resolved settings |
 | `trader migrate` | Apply SQLite migrations |
 | `trader download-bars` | Synthetic historical bars → `market_bars` |
-| `trader scan` | Eligibility + opportunity ranking (offline mock) |
-| `trader backtest` | Offline strategy backtest with costs + risk sizing |
-| `trader demo-roundtrip` | Strategy candidate → mock LLM → risk → mock fill |
+| `trader backtest` | Offline strategy backtest with costs |
+| `trader scan` | Eligibility + opportunity ranking (+ optional `--analyze`) |
+| `trader analyze` | Dry analyst call (`--mock` default; `--live` on LAN) |
+| `trader demo-roundtrip` | Strategy → mock LLM → risk → mock fill |
 | `trader ollama-tags` | List models if URL reachable (exit 2 if not) |
 
 ## Layout
@@ -124,56 +119,42 @@ trading/
   config.py           YAML + env settings
   features/           Indicator pipeline (no look-ahead)
   strategies/         trend_pullback_v1
-  scanner/            Eligibility + opportunity ranking (P4)
+  scanner/            Eligibility + opportunity ranking
   data/               MarketDataPort, mock, scenarios, historical
-  llm/                OllamaClient (fail-closed) + MockLlm
-  risk/               RiskEngine (boss) — sizing, locks, kill/halt
-  journal/            SQLite JournalDB (+ opportunity_scores)
+  llm/                OllamaClient (fail-closed) + MockLlm + schema
+  risk/               RiskEngine (boss)
+  journal/            SQLite JournalDB
 research/
   costs.py            Spread / commission / slippage / swap
-  backtest.py         Offline simulator + risk wiring + reports
+  backtest.py         Offline simulator + reports
 config/default.yaml
-migrations/
+migrations/001_initial.sql … 003_llm_decisions.sql
 tests/
 ```
 
-## Tests
-
-```powershell
-uv run pytest
-# or: pytest
-```
-
-All default tests are offline (no LAN/Ollama/MT5 required). Scanner tests cover eligibility rejects, deterministic ranking, correlation penalty, and “score never alone trades.”
-
-## Phase 4 scope
+## Phase 5 scope
 
 **In**
 
-- Multi-symbol scanner for configured universe × M5/M15
-- Eligibility gates (bars, freshness, spread, gap, broker/API/session, risk lock)
-- Deterministic opportunity score components (persisted to `opportunity_scores`)
-- Top-N selection for optional strategy evaluation
-- `trader scan` CLI (offline/mock)
-- Fail-closed when risk is locked
+- Ollama client → `OLLAMA_BASE_URL` / config default `http://192.168.8.22:11434`
+- Primary model `qwen3.8:27b`; optional `qwen3.5:9b` screen
+- Strict JSON schema; unknown fields / bad enums rejected
+- Timeouts and HTTP errors → `REJECT` (fail closed; no trade boost)
+- Journal: prompt version, model, input hash, raw + validated response
+- `risk_modifier` only reduces size; RiskEngine remains boss
+- Optional `scan --analyze` and `trader analyze` dry-run CLI
+- Offline mocks for CI
 
 **Out (later phases)**
 
-- Full Qwen schema journal workflow (P5)
 - Demo/live MT5 order lifecycle (P6+)
 - Dashboard / kill-switch API (P7)
-- Live market-session calendar (flags only in P4)
+- Paper soak / live pilot (P8–P9)
 
 ## Safety
 
-- Fail closed when Ollama is down or returns bad JSON
+- Fail closed when Ollama is down, times out, or returns bad JSON
 - `risk_modifier` may only **reduce** size
-- Scanner score never bypasses RiskEngine
 - No martingale / averaging down
 - No live order CLI
-- Backtests/scans are research only — not a live edge claim
 - Do not optimize for a fixed daily dollar target
-
-## Remotes
-
-Canonical GitHub (user): `https://github.com/TitanSarim/agentic-trading`
