@@ -176,6 +176,26 @@ class MonitoringSettings(BaseModel):
     webhook_url: str | None = None
 
 
+class ValidationSettings(BaseModel):
+    """Phase 8 — walk-forward / stress / soak (offline validation)."""
+
+    train_bars: int = 200
+    test_bars: int = 80
+    step_bars: int = 80
+    mode: Literal["rolling", "expanding"] = "rolling"
+    min_folds: int = 2
+    min_oos_trades: int = 1
+    require_non_negative_expectancy: bool = False
+    max_oos_drawdown: float | None = None
+    soak_ticks: int = 40
+    soak_bars: int = 200
+    report_dir: str = "reports"
+    default_bars: int = 400
+    scenario: Literal["flat", "trend_pullback"] = "trend_pullback"
+    spread_shock_mult: float = 5.0
+    slippage_shock_pips: float = 3.0
+
+
 class Settings(BaseModel):
     ollama: OllamaSettings = Field(default_factory=OllamaSettings)
     mt5: Mt5Settings = Field(default_factory=Mt5Settings)
@@ -190,6 +210,7 @@ class Settings(BaseModel):
     backtest: BacktestSettings = Field(default_factory=BacktestSettings)
     scanner: ScannerSettings = Field(default_factory=ScannerSettings)
     monitoring: MonitoringSettings = Field(default_factory=MonitoringSettings)
+    validation: ValidationSettings = Field(default_factory=ValidationSettings)
     config_path: str | None = None
 
     @property

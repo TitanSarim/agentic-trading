@@ -24,6 +24,11 @@ data/*.db-journal
 *.sqlite
 *.sqlite3
 
+# Validation report outputs (regenerate via trader validate)
+reports/*.json
+reports/*.md
+!reports/.gitkeep
+
 # IDE / OS
 .idea/
 .vscode/

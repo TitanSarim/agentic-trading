@@ -58,6 +58,24 @@ monitoring:
   alerts_enabled: true
   webhook_url: null  # optional POST JSON; empty = log-only
 
+# Phase 8 — walk-forward / stress / soak (offline validation before tiny live)
+validation:
+  train_bars: 200
+  test_bars: 80
+  step_bars: 80
+  mode: "rolling"  # rolling | expanding
+  min_folds: 2
+  min_oos_trades: 1
+  require_non_negative_expectancy: false
+  max_oos_drawdown: null
+  soak_ticks: 40
+  soak_bars: 200
+  report_dir: "reports"
+  default_bars: 400
+  scenario: "trend_pullback"
+  spread_shock_mult: 5.0
+  slippage_shock_pips: 3.0
+
 database:
   path: "data/trader.db"
 
