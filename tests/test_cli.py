@@ -43,3 +43,11 @@ def test_health_and_demo_roundtrip(tmp_path: Path, monkeypatch) -> None:
     assert bt.exit_code == 0
     assert "trend_pullback_v1" in bt.stdout
     assert "expectancy" in bt.stdout
+
+    scan = runner.invoke(
+        app,
+        ["scan", "--symbol", "EURUSD", "--timeframe", "M5", "--bars", "120", "--json"],
+    )
+    assert scan.exit_code == 0
+    assert "opportunity_score" in scan.stdout
+    assert "never opens a trade" in scan.stdout.lower() or "RiskEngine" in scan.stdout

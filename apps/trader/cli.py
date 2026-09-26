@@ -1,12 +1,11 @@
-"""Trader CLI — health, migrate, download-bars, backtest, ollama-tags.
+"""Trader CLI — health, migrate, download-bars, backtest, scan, ollama-tags.
 
-No live order placement. Backtests are offline (mock/sample bars only).
+No live order placement. Backtests/scans are offline (mock/sample bars only).
 """
 
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -24,12 +23,18 @@ from trading.journal.db import JournalDB
 from trading.llm.factory import create_llm
 from trading.logging_setup import configure_logging, get_logger
 from trading.risk.engine import RiskEngine
+from trading.scanner import (
+    EligibilityContext,
+    MarketScanner,
+    MarketSnapshot,
+    ScannerConfig,
+)
 from trading.strategies.trend_pullback import TrendPullbackConfig, TrendPullbackStrategy
 from trading.types import Timeframe
 
 app = typer.Typer(
     name="trader",
-    help="Agentic trading CLI (Phase 3 risk). No live trades.",
+    help="Agentic trading CLI (Phase 4 scanner). No live trades.",
     add_completion=False,
 )
 console = Console()
@@ -116,6 +121,10 @@ def health(ctx: typer.Context) -> None:
         f"daily_lock={settings.risk.daily_loss_lock_pct}, "
         "LLM cannot raise caps)"
     )
+    console.print(
+        f"[bold]scanner[/bold]: top_n={settings.scanner.top_n} "
+        "(score ranks only — RiskEngine still must approve)"
+    )
 
     # Ollama optional — fail soft in health (cloud cannot reach .22)
     llm = create_llm(settings)
@@ -136,7 +145,7 @@ def health(ctx: typer.Context) -> None:
 
     if not ok:
         raise typer.Exit(code=1)
-    console.print("[green]health ok[/green] (Phase 3 risk engine)")
+    console.print("[green]health ok[/green] (Phase 4 scanner)")
 
 
 @app.command("ollama-tags")
@@ -202,9 +211,9 @@ def download_bars(
 @app.command("demo-roundtrip")
 def demo_roundtrip(ctx: typer.Context) -> None:
     """Mock broker + mock LLM + risk stub round-trip (no live orders)."""
-    from trading.types import Side, TradeCandidate
     from brokers.mock import MockBroker
     from trading.llm.mock import MockLlm
+    from trading.types import Side, TradeCandidate
 
     settings = ctx.obj["settings"]
     db = JournalDB(settings.database.path)
@@ -412,6 +421,157 @@ def backtest(
             "[dim]Offline research only — not live performance. "
             "Risk engine sizes/rejects; Qwen cannot raise caps. No live orders.[/dim]"
         )
+
+
+@app.command("scan")
+def scan(
+    ctx: typer.Context,
+    symbol: Optional[str] = typer.Option(
+        None,
+        "--symbol",
+        "-s",
+        help="Limit to one symbol (default: full universe)",
+    ),
+    timeframe: Optional[str] = typer.Option(
+        None,
+        "--timeframe",
+        "-t",
+        help="M5, M15, or omit for both configured timeframes",
+    ),
+    bars: Optional[int] = typer.Option(
+        None,
+        "--bars",
+        "-n",
+        help="Synthetic bars per market (default: scanner.default_bars)",
+    ),
+    top_n: Optional[int] = typer.Option(
+        None,
+        "--top-n",
+        help="Override scanner.top_n",
+    ),
+    lock_risk: bool = typer.Option(
+        False,
+        "--lock-risk",
+        help="Simulate risk lock (all markets ineligible) — fail-closed demo",
+    ),
+    json_out: bool = typer.Option(
+        False,
+        "--json",
+        help="Print machine-readable JSON only",
+    ),
+) -> None:
+    """Rank configured symbols on M5/M15 by opportunity score (offline mock).
+
+    Score never alone trades — top-N may emit strategy candidates, but RiskEngine
+    must still approve before any order path. No live broker orders.
+    """
+    settings = ctx.obj["settings"]
+    if timeframe is not None and timeframe not in ("M5", "M15"):
+        console.print("[red]timeframe must be M5 or M15[/red]")
+        raise typer.Exit(code=1)
+
+    symbols = [symbol] if symbol else list(settings.universe.symbols)
+    timeframes = (
+        [timeframe]
+        if timeframe
+        else list(settings.universe.timeframes)
+    )
+    count = bars or settings.scanner.default_bars
+
+    scanner_settings = settings.scanner.model_copy(
+        update={"top_n": top_n} if top_n is not None else {}
+    )
+    risk = RiskEngine(settings.risk)
+    if lock_risk:
+        risk.lock_new_trades("CLI_LOCK_RISK_DEMO")
+
+    market = MockMarketData(
+        symbols=symbols,
+        scenario=settings.scanner.scenario,
+    )
+    from datetime import datetime, timedelta, timezone
+
+    # Align every series so the last bar shares one as-of clock (multi-TF offline).
+    as_of = datetime(2024, 6, 1, 12, 0, tzinfo=timezone.utc)
+    snapshots: list[MarketSnapshot] = []
+    for sym in symbols:
+        for tf_name in timeframes:
+            tf = Timeframe(tf_name)
+            series = market.get_bars(sym, tf, count=count)
+            step = timedelta(minutes=5 if tf == Timeframe.M5 else 15)
+            start = as_of - step * (len(series) - 1)
+            anchored = [
+                b.model_copy(update={"time": start + step * i})
+                for i, b in enumerate(series)
+            ]
+            snapshots.append(MarketSnapshot(symbol=sym, timeframe=tf, bars=anchored))
+
+    scanner = MarketScanner(
+        ScannerConfig(
+            settings=scanner_settings,
+            strategy=settings.strategy,
+            evaluate_strategy=settings.scanner.evaluate_strategy,
+            correlation_groups=list(settings.risk.correlation_groups),
+            pip_size=dict(settings.risk.pip_size),
+        ),
+        risk_engine=risk,
+    )
+    report = scanner.rank(
+        snapshots,
+        context=EligibilityContext(
+            now=as_of,
+            broker_available=True,
+            api_healthy=True,
+            market_open=True,
+            risk_engine=risk,
+        ),
+    )
+
+    db = JournalDB(settings.database.path)
+    db.migrate()
+    score_ids = db.record_scan_report(report)
+    # Journal strategy candidates when present — still no orders.
+    for row in report.selected:
+        if row.candidate is not None:
+            db.record_candidate(row.candidate)
+    payload = report.to_dict()
+    payload["score_row_ids"] = score_ids
+    db.record_system_event("scan_complete", payload)
+    db.close()
+
+    if json_out:
+        console.print_json(data=payload)
+    else:
+        console.print(
+            f"[bold]scanner[/bold] top_n={report.top_n}  "
+            f"symbols={symbols}  tfs={timeframes}  bars={count}"
+        )
+        if report.risk_locked:
+            console.print(
+                f"[yellow]risk locked[/yellow]: {report.risk_lock_reason} "
+                "(all markets ineligible — fail closed)"
+            )
+        console.print("[bold]selected (top-N)[/bold]:")
+        if not report.selected:
+            console.print("  (none)")
+        for row in report.selected:
+            cand = (
+                f" candidate={row.candidate.direction}@{row.candidate.setup_score}"
+                if row.candidate
+                else " candidate=none"
+            )
+            console.print(
+                f"  #{row.rank} {row.symbol} {row.timeframe.value} "
+                f"score={row.opportunity_score:.2f} regime={row.regime}{cand}"
+            )
+        console.print("[bold]all markets[/bold]:")
+        for row in report.markets:
+            flag = "OK" if row.eligible else row.reason_code
+            console.print(
+                f"  {row.symbol} {row.timeframe.value} "
+                f"eligible={row.eligible} ({flag}) score={row.opportunity_score:.2f}"
+            )
+        console.print(f"[dim]{report.note} No live orders.[/dim]")
 
 
 def _strategy_cfg(settings: object) -> TrendPullbackConfig:

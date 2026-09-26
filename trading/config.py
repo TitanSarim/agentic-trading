@@ -132,6 +132,24 @@ class BacktestSettings(BaseModel):
     starting_equity: float = 1000.0
 
 
+class ScannerSettings(BaseModel):
+    """Phase 4 — eligibility + ranking. Score never alone opens a trade."""
+
+    top_n: int = 3
+    min_bars: int = 64
+    max_data_age_seconds: float = 300.0
+    max_spread_pips: float | None = 3.0
+    # Per-symbol overrides (XAUUSD points are wider than FX pips).
+    max_spread_pips_by_symbol: dict[str, float] = Field(
+        default_factory=lambda: {"XAUUSD": 50.0}
+    )
+    max_gap_frac: float = 0.01  # |open - prior close| / prior close
+    correlation_penalty: float = 12.0
+    default_bars: int = 120
+    scenario: Literal["flat", "trend_pullback"] = "trend_pullback"
+    evaluate_strategy: bool = True
+
+
 class Settings(BaseModel):
     ollama: OllamaSettings = Field(default_factory=OllamaSettings)
     mt5: Mt5Settings = Field(default_factory=Mt5Settings)
@@ -144,6 +162,7 @@ class Settings(BaseModel):
     strategy: StrategySettings = Field(default_factory=StrategySettings)
     costs: CostSettings = Field(default_factory=CostSettings)
     backtest: BacktestSettings = Field(default_factory=BacktestSettings)
+    scanner: ScannerSettings = Field(default_factory=ScannerSettings)
     config_path: str | None = None
 
     @property

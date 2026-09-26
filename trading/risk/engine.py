@@ -94,6 +94,18 @@ class RiskEngine:
         return self._halted
 
     @property
+    def new_trades_locked(self) -> bool:
+        return self._new_trades_locked or self._kill_switch or self._halted
+
+    @property
+    def lock_reason(self) -> str:
+        if self._kill_switch:
+            return self._kill_reason or "KILL_SWITCH"
+        if self._halted:
+            return self._halt_reason or "HALTED"
+        return self._lock_reason
+
+    @property
     def consecutive_losses(self) -> int:
         return self._consecutive_losses
 

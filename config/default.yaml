@@ -82,3 +82,17 @@ backtest:
   scenario: "trend_pullback"  # synthetic offline scenario; not live data
   use_risk_engine: true       # size/reject via RiskEngine (P3)
   starting_equity: 1000.0
+
+# Phase 4 — scanner ranks only; RiskEngine still must approve any trade
+scanner:
+  top_n: 3
+  min_bars: 64
+  max_data_age_seconds: 300
+  max_spread_pips: 3.0
+  max_spread_pips_by_symbol:
+    XAUUSD: 50.0
+  max_gap_frac: 0.01
+  correlation_penalty: 12.0
+  default_bars: 120
+  scenario: "trend_pullback"
+  evaluate_strategy: true
