@@ -1,6 +1,7 @@
-"""Trader CLI — health, migrate, download-bars, backtest, scan, analyze, execute-demo.
+"""Trader CLI — health, status, kill/halt, execute-demo, scan, analyze.
 
-Demo execution is dry-run by default. Live (real-money) path is disabled in P6.
+Demo execution is dry-run by default. Live (real-money) path is disabled.
+Phase 7 adds operator kill/halt/resume and a minimal control HTTP API.
 """
 
 from __future__ import annotations
@@ -24,6 +25,11 @@ from trading.journal.db import JournalDB
 from trading.llm.factory import create_llm
 from trading.llm.pipeline import analyze_candidates
 from trading.logging_setup import configure_logging, get_logger
+from trading.monitoring.alerts import AlertSink
+from trading.monitoring.api import serve_control_api
+from trading.monitoring.control import ControlStore
+from trading.monitoring.heartbeat import HeartbeatStore
+from trading.monitoring.status import build_status_report
 from trading.risk.engine import RiskEngine
 from trading.scanner import (
     EligibilityContext,
@@ -36,7 +42,7 @@ from trading.types import Timeframe
 
 app = typer.Typer(
     name="trader",
-    help="Agentic trading CLI (Phase 6 demo execution). Live path disabled.",
+    help="Agentic trading CLI (Phase 7 monitoring). Live path disabled.",
     add_completion=False,
 )
 console = Console()
@@ -44,6 +50,13 @@ console = Console()
 
 def _settings(config: Optional[Path]) -> object:
     return load_settings(config)
+
+
+def _alerts(settings) -> AlertSink:
+    return AlertSink(
+        webhook_url=settings.monitoring.webhook_url,
+        enabled=settings.monitoring.alerts_enabled,
+    )
 
 
 @app.callback()
@@ -130,6 +143,17 @@ def health(ctx: typer.Context) -> None:
         f"daily_lock={settings.risk.daily_loss_lock_pct}, "
         "LLM cannot raise caps)"
     )
+
+    control = ControlStore(db).get()
+    HeartbeatStore(
+        db,
+        stale_after_seconds=settings.monitoring.heartbeat_stale_seconds,
+    ).beat("trader", {"cmd": "health"})
+    console.print(
+        f"[bold]control[/bold]: kill={control.kill_switch} "
+        f"halted={control.halted} blocked={control.new_entries_blocked}"
+        + (f" reason={control.block_reason}" if control.new_entries_blocked else "")
+    )
     console.print(
         f"[bold]scanner[/bold]: top_n={settings.scanner.top_n} "
         "(score ranks only — RiskEngine still must approve)"
@@ -168,7 +192,193 @@ def health(ctx: typer.Context) -> None:
 
     if not ok:
         raise typer.Exit(code=1)
-    console.print("[green]health ok[/green] (Phase 6 demo execution)")
+    console.print("[green]health ok[/green] (Phase 7 monitoring)")
+
+
+@app.command("status")
+def status(
+    ctx: typer.Context,
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable JSON"),
+    beat: bool = typer.Option(
+        True,
+        "--beat/--no-beat",
+        help="Write a trader heartbeat while reading status",
+    ),
+) -> None:
+    """Operator status: control flags, heartbeats, equity, recent events."""
+    settings = ctx.obj["settings"]
+    db = JournalDB(settings.database.path)
+    db.migrate()
+    if beat:
+        HeartbeatStore(
+            db,
+            stale_after_seconds=settings.monitoring.heartbeat_stale_seconds,
+        ).beat("trader", {"cmd": "status"})
+    report = build_status_report(settings, db)
+    db.record_system_event("status_check", {"healthy": report.healthy, "message": report.message})
+    payload = report.to_dict()
+    db.close()
+
+    if json_out:
+        console.print_json(data=payload)
+    else:
+        console.print(
+            f"[bold]status[/bold] healthy={report.healthy} message={report.message}"
+        )
+        c = report.control
+        console.print(
+            f"control: kill={c.kill_switch} halted={c.halted} "
+            f"blocked={c.new_entries_blocked} reason={c.block_reason or '-'}"
+        )
+        console.print(
+            f"equity={report.last_equity} mode={report.last_account_mode} "
+            f"open_positions={report.open_positions} orders={report.order_count}"
+        )
+        if report.heartbeats:
+            for hb in report.heartbeats:
+                console.print(
+                    f"heartbeat {hb['component']}: age={hb['age_seconds']}s "
+                    f"stale={hb['stale']}"
+                )
+
+
+@app.command()
+def halt(
+    ctx: typer.Context,
+    reason: str = typer.Option("HALTED", "--reason", "-r", help="Halt reason code"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Halt new entries (fail-closed). Open positions are not closed by this command."""
+    settings = ctx.obj["settings"]
+    db = JournalDB(settings.database.path)
+    db.migrate()
+    state = ControlStore(db).halt(reason, source="operator")
+    _alerts(settings).emit("warning", "HALTED", reason, state.to_dict())
+    payload = state.to_dict()
+    db.close()
+    if json_out:
+        console.print_json(data=payload)
+    else:
+        console.print(f"[yellow]halted[/yellow] reason={state.halt_reason}")
+        console.print("[dim]New entries blocked. Resume with: trader resume[/dim]")
+
+
+@app.command()
+def resume(
+    ctx: typer.Context,
+    clear_kill: bool = typer.Option(
+        False,
+        "--clear-kill",
+        help="Also clear the emergency kill switch",
+    ),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Clear halt (optionally clear kill). Does not resume if kill remains set."""
+    settings = ctx.obj["settings"]
+    db = JournalDB(settings.database.path)
+    db.migrate()
+    store = ControlStore(db)
+    state = store.resume(clear_kill=clear_kill, source="operator")
+    # If kill still active, new entries remain blocked.
+    if state.kill_switch and not clear_kill:
+        console.print(
+            "[yellow]halt cleared but kill switch still active[/yellow] — "
+            "use trader resume --clear-kill or trader clear-kill"
+        )
+    _alerts(settings).emit("info", "RESUMED", "operator resume", state.to_dict())
+    payload = state.to_dict()
+    db.close()
+    if json_out:
+        console.print_json(data=payload)
+    else:
+        console.print(
+            f"[green]resume[/green] kill={state.kill_switch} "
+            f"halted={state.halted} blocked={state.new_entries_blocked}"
+        )
+
+
+@app.command()
+def kill(
+    ctx: typer.Context,
+    reason: str = typer.Option(
+        "KILL_SWITCH", "--reason", "-r", help="Kill reason code"
+    ),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Emergency kill switch — blocks new entries until clear-kill / resume --clear-kill."""
+    settings = ctx.obj["settings"]
+    db = JournalDB(settings.database.path)
+    db.migrate()
+    state = ControlStore(db).kill(reason, source="operator")
+    _alerts(settings).emit("critical", "KILL_SWITCH", reason, state.to_dict())
+    payload = state.to_dict()
+    db.close()
+    if json_out:
+        console.print_json(data=payload)
+    else:
+        console.print(f"[red]kill switch engaged[/red] reason={state.kill_reason}")
+        console.print(
+            "[dim]Clear with: trader resume --clear-kill  (or trader clear-kill + trader resume)[/dim]"
+        )
+
+
+@app.command("clear-kill")
+def clear_kill_cmd(
+    ctx: typer.Context,
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Clear kill switch only (halt may still be active)."""
+    settings = ctx.obj["settings"]
+    db = JournalDB(settings.database.path)
+    db.migrate()
+    state = ControlStore(db).clear_kill(source="operator")
+    payload = state.to_dict()
+    db.close()
+    if json_out:
+        console.print_json(data=payload)
+    else:
+        console.print(
+            f"[green]kill cleared[/green] halted={state.halted} "
+            f"blocked={state.new_entries_blocked}"
+        )
+
+
+@app.command("serve-control")
+def serve_control(
+    ctx: typer.Context,
+    host: Optional[str] = typer.Option(
+        None, "--host", help="Bind host (default monitoring.api_host)"
+    ),
+    port: Optional[int] = typer.Option(
+        None, "--port", help="Bind port (default monitoring.api_port / 8787)"
+    ),
+) -> None:
+    """Minimal local control HTTP API: /health /status /halt /resume /kill.
+
+    Bind defaults to 127.0.0.1:8787. No auth — operator LAN / localhost only.
+    """
+    settings = ctx.obj["settings"]
+    if not settings.monitoring.api_enabled:
+        console.print("[red]monitoring.api_enabled=false[/red]")
+        raise typer.Exit(code=1)
+    bind_host = host or settings.monitoring.api_host
+    bind_port = port if port is not None else settings.monitoring.api_port
+    db = JournalDB(settings.database.path)
+    db.migrate()
+    db.record_system_event(
+        "control_api_start",
+        {"host": bind_host, "port": bind_port},
+    )
+    db.close()
+    console.print(
+        f"[bold]control API[/bold] http://{bind_host}:{bind_port} "
+        "(GET /health /status ; POST /halt /resume /kill /clear-kill)"
+    )
+    console.print("[dim]Ctrl+C to stop. Kill/halt persist in SQLite.[/dim]")
+    try:
+        serve_control_api(settings, host=bind_host, port=bind_port, blocking=True)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]control API stopped[/yellow]")
 
 
 @app.command("ollama-tags")

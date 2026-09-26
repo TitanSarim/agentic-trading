@@ -28,7 +28,7 @@ def test_health_and_demo_roundtrip(tmp_path: Path, monkeypatch) -> None:
     health = runner.invoke(app, ["health"])
     assert health.exit_code == 0
     assert "health ok" in health.stdout
-    assert "Phase 6" in health.stdout
+    assert "Phase 7" in health.stdout
 
     demo = runner.invoke(app, ["demo-roundtrip"])
     assert demo.exit_code == 0

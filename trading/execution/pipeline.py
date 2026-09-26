@@ -19,6 +19,9 @@ from trading.execution.reconcile import BrokerReconciler, ReconcileReport
 from trading.journal.db import JournalDB
 from trading.llm.base import LlmPort
 from trading.llm.pipeline import analyze_candidates
+from trading.monitoring.alerts import AlertSink
+from trading.monitoring.control import ControlStore
+from trading.monitoring.heartbeat import HeartbeatStore
 from trading.risk.context import RiskMarketContext, RiskPortfolioContext
 from trading.risk.engine import RiskEngine
 from trading.scanner import (
@@ -85,6 +88,50 @@ def run_demo_pipeline(
     mode: Literal["dry-run", "submit"] = "submit" if submit else "dry-run"
 
     risk_engine = RiskEngine(settings.risk)
+    control = ControlStore(db)
+    control_state = control.apply_to_risk(risk_engine)
+    alerts = AlertSink(
+        webhook_url=settings.monitoring.webhook_url,
+        enabled=settings.monitoring.alerts_enabled,
+    )
+    HeartbeatStore(
+        db,
+        stale_after_seconds=settings.monitoring.heartbeat_stale_seconds,
+    ).beat(
+        "trader",
+        {"pipeline": "execute-demo", "mode": mode, "symbol": symbol},
+    )
+
+    # Fail closed: persistent kill/halt blocks new entries (positions still managed elsewhere).
+    if control_state.new_entries_blocked:
+        reason = control_state.block_reason
+        alerts.emit(
+            "warning",
+            reason or "ENTRIES_BLOCKED",
+            f"execute-demo blocked by control: {reason}",
+            control_state.to_dict(),
+        )
+        db.record_system_event(
+            "execute_demo_blocked_control",
+            {"reason": reason, "control": control_state.to_dict()},
+        )
+        return DemoPipelineResult(
+            mode=mode,
+            account_mode=account_mode,
+            reconcile=None,
+            candidate=None,
+            candidate_id=None,
+            analyst=None,
+            risk=RiskDecision(
+                approved=False,
+                reason_code=reason or "ENTRIES_BLOCKED",
+                new_trades_locked=True,
+            ),
+            execution=None,
+            message=f"new entries blocked: {reason}",
+            extras={"control": control_state.to_dict()},
+        )
+
     engine = ExecutionEngine(
         broker,
         settings.execution,
@@ -99,6 +146,14 @@ def run_demo_pipeline(
     db.record_system_event("reconcile", report.to_dict())
     if report.new_trades_should_lock:
         risk_engine.lock_new_trades("UNEXPECTED_BROKER_POSITION")
+        if settings.monitoring.auto_halt_on_risk_lock:
+            control.halt("UNEXPECTED_BROKER_POSITION", source="auto")
+            alerts.emit(
+                "error",
+                "UNEXPECTED_BROKER_POSITION",
+                report.message,
+                report.to_dict(),
+            )
         return DemoPipelineResult(
             mode=mode,
             account_mode=account_mode,
@@ -244,6 +299,23 @@ def run_demo_pipeline(
     db.record_risk_decision(decision, candidate_id=cid)
 
     if not decision.approved:
+        # Auto-halt on account-level risk locks (daily/weekly/consecutive).
+        lock_codes = {
+            "DAILY_LOSS_LOCK",
+            "WEEKLY_DRAWDOWN_LOCK",
+            "CONSECUTIVE_LOSS_LOCK",
+        }
+        if (
+            settings.monitoring.auto_halt_on_risk_lock
+            and decision.reason_code in lock_codes
+        ):
+            control.halt(decision.reason_code, source="auto")
+            alerts.emit(
+                "error",
+                decision.reason_code,
+                f"auto halt on risk lock: {decision.reason_code}",
+                decision.model_dump(mode="json"),
+            )
         return DemoPipelineResult(
             mode=mode,
             account_mode=account_mode,

@@ -1,4 +1,4 @@
-# Agentic Trading — Phase 6 demo execution (IC Markets)
+# Agentic Trading — Phase 7 monitoring / kill switches
 
 Python trading app for the Autonomous Qwen + Ollama + MT5 (IC Markets) system.
 
@@ -6,89 +6,92 @@ Python trading app for the Autonomous Qwen + Ollama + MT5 (IC Markets) system.
 
 **Host:** Windows machine co-located with MT5. Models live on Linux `192.168.8.22` Ollama.
 
-Phase 6 wires **demo order lifecycle** on IC Markets via MetaTrader5 Python: idempotent client order IDs, mandatory SL/TP, reconcile vs journal, and `trader execute-demo` (dry-run by default). **No live/real-money path** (`execution.allow_live=false`).
+Phase 7 adds **operator visibility and kill switches**: persistent halt/kill/resume (SQLite), heartbeats, status CLI, optional local control HTTP API, and log/webhook alert stubs. Kill/halt **stop new entries** (fail-closed); they do not close open positions. Demo execution defaults are unchanged.
 
 ## Quick start (Windows)
 
 ```powershell
-# Python 3.11+ recommended
 cd path\to\agentic-trading
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-# On the MT5 host only, also:
+# On the MT5 host only:
 pip install MetaTrader5
-# or: pip install -e ".[mt5]"
 
 copy .env.example .env
 
 trader health
-trader migrate
+trader status --json
 trader execute-demo --backend mock --dry-run --json
-trader analyze --mock --json
-trader scan --symbol EURUSD -t M5 --json
 ```
+
+## Operator kill switch
+
+Halt and kill state is stored in the journal DB and survives process restarts. `RiskEngine` and `trader execute-demo` both respect it (fail-closed).
+
+```powershell
+# Block new entries (positions not auto-closed)
+trader halt --reason OPS_HALT
+trader status --json
+
+# execute-demo / risk will refuse new entries while halted
+trader execute-demo --backend mock --dry-run --json
+
+# Clear halt
+trader resume
+
+# Emergency kill (also sets halt). Clear with:
+trader kill --reason EMERGENCY
+trader resume --clear-kill
+# or: trader clear-kill && trader resume
+```
+
+### Optional control HTTP (localhost)
+
+```powershell
+trader serve-control
+# GET  http://127.0.0.1:8787/health
+# GET  http://127.0.0.1:8787/status
+# POST http://127.0.0.1:8787/halt        {"reason":"OPS_HALT"}
+# POST http://127.0.0.1:8787/resume      {"clear_kill":false}
+# POST http://127.0.0.1:8787/kill        {"reason":"EMERGENCY"}
+# POST http://127.0.0.1:8787/clear-kill
+```
+
+No auth — bind to `127.0.0.1` only (default). Override with `TRADER_CONTROL_HOST` / `TRADER_CONTROL_PORT`.
+
+### Alerts
+
+Structured logs always. Optional webhook:
+
+```powershell
+$env:TRADER_ALERT_WEBHOOK = "http://127.0.0.1:9999/hook"
+```
+
+Empty / unset = log-only (no required SaaS).
 
 ## Offline tests (CI / cloud)
 
 ```powershell
 pip install -e ".[dev]"
 pytest
+trader status --json
+trader halt --reason TEST; trader resume
 trader execute-demo --backend mock --dry-run --json
-trader execute-demo --backend mock --submit --confirm-demo --mock-llm --json
 ```
-
-Cloud has no MT5 — tests use `MockBroker`. Never import MetaTrader5 unless on Windows.
 
 ## IC Markets demo on Windows
 
-1. Start the terminal and log into a **demo** account:
-
-```text
-C:\Program Files\MetaTrader 5 IC Markets Global\terminal64.exe
-```
-
-2. Install MetaTrader5 Python next to the app:
-
-```powershell
-pip install MetaTrader5
-```
-
-3. Optional credentials in `.env` (never commit secrets):
+Same as Phase 6 — dry-run default; submit only with `--confirm-demo` on demo:
 
 ```powershell
 $env:TRADER_BROKER_BACKEND = "mt5"
 $env:TRADER_BROKER_MODE = "demo"
-# Optional if not already logged in via terminal UI:
-# $env:MT5_LOGIN = "..."
-# $env:MT5_PASSWORD = "..."
-# $env:MT5_SERVER = "ICMarketsSC-Demo"
-```
-
-4. Dry-run (no order sent):
-
-```powershell
 trader execute-demo --backend mt5 --dry-run --json
-```
-
-5. Submit on **demo only** (explicit confirm required):
-
-```powershell
 trader execute-demo --backend mt5 --submit --confirm-demo --json
 ```
 
-`--submit` without `--confirm-demo` is rejected. Live mode is refused unless `execution.allow_live=true` (Phase 9 — not enabled by default).
-
-## Optional live Ollama (Windows LAN only)
-
-```powershell
-$env:OLLAMA_BASE_URL = "http://192.168.8.22:11434"
-trader ollama-tags
-trader analyze --live --json
-trader execute-demo --backend mock --dry-run --live-llm --json
-```
-
-Cloud agents **cannot** reach `192.168.8.22`.
+Live path remains disabled (`execution.allow_live=false`).
 
 ## Configuration
 
@@ -96,63 +99,64 @@ Resolution: **defaults < `config/default.yaml` < environment** (env wins).
 
 | Key / env | Default | Notes |
 |-----------|---------|--------|
-| `broker.backend` / `TRADER_BROKER_BACKEND` | `mock` | `mt5` only on Windows |
-| `broker.mode` / `TRADER_BROKER_MODE` | `demo` | Synced with `mt5.account_mode` |
-| `execution.allow_live` / `TRADER_ALLOW_LIVE` | `false` | P6 refuses live |
-| `execution.require_attached_stop` | `true` | SL + TP required |
-| `mt5.terminal_path` | IC Markets Global `terminal64.exe` | Locked path |
+| `monitoring.api_host` / `TRADER_CONTROL_HOST` | `127.0.0.1` | Control API bind |
+| `monitoring.api_port` / `TRADER_CONTROL_PORT` | `8787` | Control API port |
+| `monitoring.heartbeat_stale_seconds` / `TRADER_HEARTBEAT_STALE_SECONDS` | `120` | Stale process hint |
+| `monitoring.auto_halt_on_risk_lock` | `true` | Auto halt on daily/weekly/consecutive lock |
+| `monitoring.webhook_url` / `TRADER_ALERT_WEBHOOK` | empty | Optional POST JSON |
+| `broker.mode` / `TRADER_BROKER_MODE` | `demo` | P6 demo gate |
+| `execution.allow_live` / `TRADER_ALLOW_LIVE` | `false` | Live only after §9 (P9) |
 | `OLLAMA_BASE_URL` | `http://192.168.8.22:11434` | Env preferred |
-| `ollama.analyst_model` | `qwen3.8:27b` | Locked primary |
 
 ## CLI
 
 | Command | Purpose |
 |---------|---------|
-| `trader health` | Config, DB, mock broker, optional Ollama |
-| `trader execute-demo` | Demo path: dry-run default; `--submit --confirm-demo` |
-| `trader analyze` | Dry analyst (`--mock` / `--live`) |
-| `trader scan` | Eligibility + ranking (+ optional `--analyze`) |
-| `trader backtest` | Offline strategy backtest |
-| `trader demo-roundtrip` | Legacy mock fill smoke |
-| `trader ollama-tags` | List models if reachable (exit 2 if not) |
+| `trader health` | Config, DB, broker, control flags, Ollama ping |
+| `trader status` | Control, heartbeats, equity, recent events |
+| `trader halt` / `resume` / `kill` / `clear-kill` | Operator kill switch |
+| `trader serve-control` | Minimal local HTTP control API |
+| `trader execute-demo` | Demo path (respects halt/kill; dry-run default) |
+| `trader analyze` / `scan` / `backtest` | Research / analyst paths |
 
 ## Layout
 
 ```text
 apps/trader/          CLI
-brokers/              BrokerPort, MockBroker, Mt5Broker (Windows)
+brokers/              BrokerPort, MockBroker, Mt5Broker
 trading/
+  monitoring/         ControlStore, heartbeats, alerts, status, control API
   execution/          IDs, ExecutionEngine, reconcile, demo pipeline
-  risk/               RiskEngine (boss)
-  llm/                Ollama + MockLlm
-  scanner/ strategies/ features/ data/ journal/
+  risk/               RiskEngine (boss; kill/halt hooks)
+  llm/ scanner/ strategies/ features/ data/ journal/
 config/default.yaml
-migrations/001…004_orders_fills.sql
+migrations/001…005_monitoring.sql
 tests/
 ```
 
-## Phase 6 scope
+## Phase 7 scope
 
 **In**
 
-- Real `Mt5Broker` via MetaTrader5 when available; graceful fail off Windows / terminal down
-- Idempotent client order IDs; SL/TP required
-- Reconcile broker positions vs journal (unexpected → lock new trades)
-- `broker.mode=demo`; refuse live unless explicitly allowed later (P9)
-- `trader execute-demo` dry-run by default; `--submit` only with `--confirm-demo`
-- Wire: scan/strategy → risk → optional analyze → demo execute
-- Journal orders / fills / positions; offline mock tests green
+- Persistent kill / halt / resume (SQLite `control_state`)
+- `RiskEngine` + `execute-demo` fail-closed when blocked
+- Heartbeats + stale-process detection hooks
+- Status CLI + minimal localhost control HTTP
+- Alert stubs (log + optional webhook)
+- Journal `system_events` for halt / kill / resume
+- Auto-halt on account-level risk locks (configurable)
+- Offline tests; demo-only defaults unchanged
 
 **Out**
 
 - Live/real-money trading (P9)
-- Dashboard / kill-switch API (P7)
-- Unattended paper soak (P8)
+- Unattended paper soak / walk-forward (P8)
+- Full Grafana dashboard / required SaaS alerts
 
 ## Safety
 
-- Fail closed on broker disconnect, unexpected positions, risk locks, LLM errors
+- Fail closed on kill, halt, broker disconnect, unexpected positions, risk locks, LLM errors
+- Kill switch stops **new entries**; open positions are managed separately (not force-closed by halt)
 - `risk_modifier` may only **reduce** size
-- No martingale / averaging down
 - No live order path by default
 - Do not optimize for a fixed daily dollar target
