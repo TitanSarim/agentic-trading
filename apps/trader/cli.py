@@ -1,7 +1,7 @@
-"""Trader CLI — health, status, kill/halt, execute-demo, scan, analyze.
+"""Trader CLI — health, status, kill/halt, execute-demo, walk-forward, soak.
 
 Demo execution is dry-run by default. Live (real-money) path is disabled.
-Phase 7 adds operator kill/halt/resume and a minimal control HTTP API.
+Phase 8 adds offline walk-forward, stress, and accelerated soak validation.
 """
 
 from __future__ import annotations
@@ -17,6 +17,10 @@ from rich.console import Console
 from brokers.factory import create_broker
 from research.backtest import BacktestConfig, Backtester
 from research.costs import CostConfig, CostModel
+from research.dod_report import build_dod_report, write_dod_report
+from research.soak import SoakConfig, run_soak
+from research.stress import run_stress_suite
+from research.walk_forward import WalkForwardConfig, run_walk_forward
 from trading.config import load_settings
 from trading.data.historical import HistoricalDownloader
 from trading.data.mock import MockMarketData
@@ -42,7 +46,7 @@ from trading.types import Timeframe
 
 app = typer.Typer(
     name="trader",
-    help="Agentic trading CLI (Phase 7 monitoring). Live path disabled.",
+    help="Agentic trading CLI (Phase 8 validation). Live path disabled.",
     add_completion=False,
 )
 console = Console()
@@ -192,7 +196,7 @@ def health(ctx: typer.Context) -> None:
 
     if not ok:
         raise typer.Exit(code=1)
-    console.print("[green]health ok[/green] (Phase 7 monitoring)")
+    console.print("[green]health ok[/green] (Phase 8 validation)")
 
 
 @app.command("status")
@@ -1094,6 +1098,348 @@ def scan(
                 f"eligible={row.eligible} ({flag}) score={row.opportunity_score:.2f}"
             )
         console.print(f"[dim]{report.note} No live orders.[/dim]")
+
+
+@app.command("walk-forward")
+def walk_forward_cmd(
+    ctx: typer.Context,
+    symbol: str = typer.Option("EURUSD", "--symbol", "-s"),
+    timeframe: str = typer.Option("M5", "--timeframe", "-t"),
+    bars: Optional[int] = typer.Option(
+        None, "--bars", "-n", help="Synthetic bars (default validation.default_bars)"
+    ),
+    train_bars: Optional[int] = typer.Option(None, "--train-bars"),
+    test_bars: Optional[int] = typer.Option(None, "--test-bars"),
+    step_bars: Optional[int] = typer.Option(None, "--step-bars"),
+    mode: Optional[str] = typer.Option(None, "--mode", help="rolling | expanding"),
+    write_report: bool = typer.Option(
+        False,
+        "--write-report/--no-write-report",
+        help="Also write a partial DoD JSON/MD under reports/",
+    ),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Chronological walk-forward / out-of-sample backtest (offline)."""
+    settings = ctx.obj["settings"]
+    if timeframe not in ("M5", "M15"):
+        console.print("[red]timeframe must be M5 or M15[/red]")
+        raise typer.Exit(code=1)
+    v = settings.validation
+    wf_mode = mode or v.mode
+    if wf_mode not in ("rolling", "expanding"):
+        console.print("[red]mode must be rolling or expanding[/red]")
+        raise typer.Exit(code=1)
+
+    count = bars or v.default_bars
+    market = MockMarketData(scenario=v.scenario, seed=42)
+    series = market.get_bars(symbol, Timeframe(timeframe), count=count)
+    costs = CostModel(
+        CostConfig(
+            commission_per_lot=settings.costs.commission_per_lot,
+            slippage_pips=settings.costs.slippage_pips,
+            swap_per_lot_per_day=settings.costs.swap_per_lot_per_day,
+        )
+    )
+    risk = RiskEngine(settings.risk) if settings.backtest.use_risk_engine else None
+    report = run_walk_forward(
+        symbol,
+        timeframe,
+        series,
+        strategy_config=_strategy_cfg(settings),
+        cost_config=costs.config,
+        backtest_config=BacktestConfig(
+            volume=settings.backtest.volume,
+            max_hold_bars=settings.backtest.max_hold_bars,
+            one_position=settings.backtest.one_position,
+            use_risk_engine=settings.backtest.use_risk_engine,
+            starting_equity=settings.backtest.starting_equity,
+        ),
+        walk_config=WalkForwardConfig(
+            train_bars=train_bars or v.train_bars,
+            test_bars=test_bars or v.test_bars,
+            step_bars=step_bars or v.step_bars,
+            mode=wf_mode,  # type: ignore[arg-type]
+            min_folds=v.min_folds,
+            min_oos_trades=v.min_oos_trades,
+            max_oos_drawdown=v.max_oos_drawdown,
+            require_non_negative_expectancy=v.require_non_negative_expectancy,
+        ),
+        risk=risk,
+    )
+    payload = report.to_dict()
+
+    db = JournalDB(settings.database.path)
+    db.migrate()
+    db.record_system_event("walk_forward_complete", payload)
+    db.close()
+
+    if write_report:
+        dod = build_dod_report(walk_forward=report)
+        jp, mp = write_dod_report(
+            dod, output_dir=v.report_dir, stem="p8-walk-forward"
+        )
+        payload["report_json"] = str(jp)
+        payload["report_md"] = str(mp)
+
+    if json_out:
+        console.print_json(data=payload)
+    else:
+        mark = "[green]PASS[/green]" if report.passed else "[red]FAIL[/red]"
+        console.print(
+            f"[bold]walk-forward[/bold] {mark} folds={len(report.folds)} "
+            f"oos_trades={report.oos_trades} expectancy={report.oos_expectancy:.4f} "
+            f"dd={report.oos_max_drawdown:.4f}"
+        )
+        if report.fail_reasons:
+            console.print(f"fail_reasons: {report.fail_reasons}")
+        console.print(f"[dim]{report.note}[/dim]")
+
+    if not report.passed:
+        raise typer.Exit(code=1)
+
+
+@app.command("stress")
+def stress_cmd(
+    ctx: typer.Context,
+    symbol: str = typer.Option("EURUSD", "--symbol", "-s"),
+    timeframe: str = typer.Option("M5", "--timeframe", "-t"),
+    bars: Optional[int] = typer.Option(None, "--bars", "-n"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Run offline stress scenarios (spread, slippage, gap, consecutive losses)."""
+    settings = ctx.obj["settings"]
+    if timeframe not in ("M5", "M15"):
+        console.print("[red]timeframe must be M5 or M15[/red]")
+        raise typer.Exit(code=1)
+    v = settings.validation
+    count = bars or v.default_bars
+    series = MockMarketData(scenario=v.scenario, seed=42).get_bars(
+        symbol, Timeframe(timeframe), count=count
+    )
+    report = run_stress_suite(
+        symbol,
+        timeframe,
+        series,
+        risk_settings=settings.risk.model_copy(
+            update={"max_spread_pips": 50.0, "max_data_age_seconds": 0}
+        ),
+        base_cost=CostConfig(
+            commission_per_lot=settings.costs.commission_per_lot,
+            slippage_pips=settings.costs.slippage_pips,
+            swap_per_lot_per_day=settings.costs.swap_per_lot_per_day,
+        ),
+        backtest_config=BacktestConfig(
+            volume=settings.backtest.volume,
+            max_hold_bars=settings.backtest.max_hold_bars,
+            one_position=settings.backtest.one_position,
+            use_risk_engine=True,
+            starting_equity=settings.backtest.starting_equity,
+        ),
+        spread_mult=v.spread_shock_mult,
+        slippage_pips=v.slippage_shock_pips,
+    )
+    payload = report.to_dict()
+    db = JournalDB(settings.database.path)
+    db.migrate()
+    db.record_system_event("stress_complete", payload)
+    db.close()
+
+    if json_out:
+        console.print_json(data=payload)
+    else:
+        mark = "[green]PASS[/green]" if report.passed else "[red]FAIL[/red]"
+        console.print(f"[bold]stress[/bold] {mark}")
+        for s in report.scenarios:
+            sm = "PASS" if s.passed else "FAIL"
+            console.print(f"  {s.name}: {sm} {s.fail_reasons or ''}")
+        console.print(f"[dim]{report.note}[/dim]")
+
+    if not report.passed:
+        raise typer.Exit(code=1)
+
+
+@app.command("soak")
+def soak_cmd(
+    ctx: typer.Context,
+    ticks: Optional[int] = typer.Option(None, "--ticks", help="Accelerated loop ticks"),
+    symbol: str = typer.Option("EURUSD", "--symbol", "-s"),
+    timeframe: str = typer.Option("M5", "--timeframe", "-t"),
+    db_path: Optional[Path] = typer.Option(
+        None,
+        "--db",
+        help="SQLite path for soak control/heartbeats (default: data/soak.db)",
+    ),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Accelerated offline soak: heartbeats + halt/kill/resume (not multi-day wall clock)."""
+    settings = ctx.obj["settings"]
+    if timeframe not in ("M5", "M15"):
+        console.print("[red]timeframe must be M5 or M15[/red]")
+        raise typer.Exit(code=1)
+    v = settings.validation
+    path = db_path or Path("data/soak.db")
+    n_ticks = ticks or v.soak_ticks
+    report = run_soak(
+        db_path=path,
+        config=SoakConfig(
+            ticks=n_ticks,
+            symbol=symbol,
+            timeframe=timeframe,
+            bars=v.soak_bars,
+            halt_at_tick=max(1, n_ticks // 4),
+            kill_at_tick=max(2, n_ticks // 2),
+            resume_at_tick=max(3, (3 * n_ticks) // 4),
+        ),
+        risk_settings=settings.risk.model_copy(
+            update={"max_spread_pips": 50.0, "max_data_age_seconds": 0}
+        ),
+        stale_after_seconds=settings.monitoring.heartbeat_stale_seconds,
+    )
+    payload = report.to_dict()
+    payload["db"] = str(path)
+
+    # Journal into primary DB as well for operator trail.
+    db = JournalDB(settings.database.path)
+    db.migrate()
+    db.record_system_event("soak_complete", payload)
+    db.close()
+
+    if json_out:
+        console.print_json(data=payload)
+    else:
+        mark = "[green]PASS[/green]" if report.passed else "[red]FAIL[/red]"
+        console.print(
+            f"[bold]soak[/bold] {mark} ticks={report.ticks} "
+            f"blocks={report.control_blocks} hb={report.heartbeats} "
+            f"halt={report.halt_injected} kill={report.kill_injected} "
+            f"resume={report.resume_verified}"
+        )
+        if report.fail_reasons:
+            console.print(f"fail_reasons: {report.fail_reasons}")
+        console.print(f"[dim]{report.note}[/dim]")
+
+    if not report.passed:
+        raise typer.Exit(code=1)
+
+
+@app.command("validate")
+def validate_cmd(
+    ctx: typer.Context,
+    symbol: str = typer.Option("EURUSD", "--symbol", "-s"),
+    timeframe: str = typer.Option("M5", "--timeframe", "-t"),
+    bars: Optional[int] = typer.Option(None, "--bars", "-n"),
+    ticks: Optional[int] = typer.Option(None, "--ticks"),
+    output_dir: Optional[Path] = typer.Option(
+        None, "--output-dir", "-o", help="Report directory (default reports/)"
+    ),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Run walk-forward + stress + soak and write DoD pass/fail artifacts.
+
+    Offline only. Use before tiny live (P9); LAN demo soak still required on Windows.
+    """
+    settings = ctx.obj["settings"]
+    if timeframe not in ("M5", "M15"):
+        console.print("[red]timeframe must be M5 or M15[/red]")
+        raise typer.Exit(code=1)
+    v = settings.validation
+    count = bars or v.default_bars
+    series = MockMarketData(scenario=v.scenario, seed=42).get_bars(
+        symbol, Timeframe(timeframe), count=count
+    )
+    costs = CostConfig(
+        commission_per_lot=settings.costs.commission_per_lot,
+        slippage_pips=settings.costs.slippage_pips,
+        swap_per_lot_per_day=settings.costs.swap_per_lot_per_day,
+    )
+    risk = RiskEngine(settings.risk) if settings.backtest.use_risk_engine else None
+    wf = run_walk_forward(
+        symbol,
+        timeframe,
+        series,
+        strategy_config=_strategy_cfg(settings),
+        cost_config=costs,
+        backtest_config=BacktestConfig(
+            volume=settings.backtest.volume,
+            max_hold_bars=settings.backtest.max_hold_bars,
+            one_position=settings.backtest.one_position,
+            use_risk_engine=settings.backtest.use_risk_engine,
+            starting_equity=settings.backtest.starting_equity,
+        ),
+        walk_config=WalkForwardConfig(
+            train_bars=v.train_bars,
+            test_bars=v.test_bars,
+            step_bars=v.step_bars,
+            mode=v.mode,
+            min_folds=v.min_folds,
+            min_oos_trades=v.min_oos_trades,
+            max_oos_drawdown=v.max_oos_drawdown,
+            require_non_negative_expectancy=v.require_non_negative_expectancy,
+        ),
+        risk=risk,
+    )
+    stress = run_stress_suite(
+        symbol,
+        timeframe,
+        series,
+        risk_settings=settings.risk.model_copy(
+            update={"max_spread_pips": 50.0, "max_data_age_seconds": 0}
+        ),
+        base_cost=costs,
+        backtest_config=BacktestConfig(
+            volume=settings.backtest.volume,
+            max_hold_bars=settings.backtest.max_hold_bars,
+            one_position=True,
+            use_risk_engine=True,
+            starting_equity=settings.backtest.starting_equity,
+        ),
+        spread_mult=v.spread_shock_mult,
+        slippage_pips=v.slippage_shock_pips,
+    )
+    n_ticks = ticks or v.soak_ticks
+    soak = run_soak(
+        db_path=Path("data/soak.db"),
+        config=SoakConfig(
+            ticks=n_ticks,
+            symbol=symbol,
+            timeframe=timeframe,
+            bars=v.soak_bars,
+            halt_at_tick=max(1, n_ticks // 4),
+            kill_at_tick=max(2, n_ticks // 2),
+            resume_at_tick=max(3, (3 * n_ticks) // 4),
+        ),
+        risk_settings=settings.risk.model_copy(
+            update={"max_spread_pips": 50.0, "max_data_age_seconds": 0}
+        ),
+        stale_after_seconds=settings.monitoring.heartbeat_stale_seconds,
+    )
+    dod = build_dod_report(walk_forward=wf, stress=stress, soak=soak)
+    out = output_dir or Path(v.report_dir)
+    jp, mp = write_dod_report(dod, output_dir=out, stem="p8-validation")
+
+    payload = dod.to_dict()
+    payload["report_json"] = str(jp)
+    payload["report_md"] = str(mp)
+
+    db = JournalDB(settings.database.path)
+    db.migrate()
+    db.record_system_event("validate_complete", payload)
+    db.close()
+
+    if json_out:
+        console.print_json(data=payload)
+    else:
+        mark = "[green]PASS[/green]" if dod.overall_passed else "[red]FAIL[/red]"
+        console.print(f"[bold]validate[/bold] {mark}")
+        console.print(f"wrote {jp}")
+        console.print(f"wrote {mp}")
+        console.print(
+            "[dim]Offline P8 slice only — LAN demo soak + §9 LAN checks still required "
+            "before tiny live (P9).[/dim]"
+        )
+
+    if not dod.overall_passed:
+        raise typer.Exit(code=1)
 
 
 def _strategy_cfg(settings: object) -> TrendPullbackConfig:

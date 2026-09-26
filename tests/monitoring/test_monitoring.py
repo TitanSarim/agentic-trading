@@ -285,7 +285,7 @@ def test_cli_halt_status_resume_blocks_execute(tmp_path: Path, monkeypatch) -> N
 
     health = runner.invoke(app, ["health"])
     assert health.exit_code == 0
-    assert "Phase 7" in health.stdout
+    assert "Phase 8" in health.stdout
 
 
 def test_config_monitoring_defaults() -> None:
