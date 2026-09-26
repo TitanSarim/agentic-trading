@@ -47,6 +47,17 @@ execution:
   idempotent_client_order_ids: true
   allow_live: false  # P6 demo-only; live only after Definition of Done (P9)
 
+# Phase 7 — monitoring / kill switches (operator + auto; no required SaaS)
+monitoring:
+  api_enabled: true
+  api_host: "127.0.0.1"
+  api_port: 8787
+  heartbeat_stale_seconds: 120
+  fail_closed_on_stale: true
+  auto_halt_on_risk_lock: true
+  alerts_enabled: true
+  webhook_url: null  # optional POST JSON; empty = log-only
+
 database:
   path: "data/trader.db"
 

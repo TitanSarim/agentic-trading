@@ -160,6 +160,22 @@ class ScannerSettings(BaseModel):
     analyze_candidates: bool = False
 
 
+class MonitoringSettings(BaseModel):
+    """Phase 7 — health, kill/halt, heartbeats, optional control HTTP + webhook."""
+
+    api_enabled: bool = True
+    api_host: str = "127.0.0.1"
+    api_port: int = 8787
+    heartbeat_stale_seconds: float = 120.0
+    # When True, stale/missing heartbeat marks status unhealthy (fail-closed hint).
+    fail_closed_on_stale: bool = True
+    # Auto-engage halt when RiskEngine locks from daily/weekly/consecutive breach.
+    auto_halt_on_risk_lock: bool = True
+    alerts_enabled: bool = True
+    # Optional webhook URL (POST JSON). Empty = log-only stubs.
+    webhook_url: str | None = None
+
+
 class Settings(BaseModel):
     ollama: OllamaSettings = Field(default_factory=OllamaSettings)
     mt5: Mt5Settings = Field(default_factory=Mt5Settings)
@@ -173,6 +189,7 @@ class Settings(BaseModel):
     costs: CostSettings = Field(default_factory=CostSettings)
     backtest: BacktestSettings = Field(default_factory=BacktestSettings)
     scanner: ScannerSettings = Field(default_factory=ScannerSettings)
+    monitoring: MonitoringSettings = Field(default_factory=MonitoringSettings)
     config_path: str | None = None
 
     @property
@@ -255,6 +272,24 @@ def _env_overrides() -> dict[str, Any]:
         overrides["execution"] = {
             "allow_live": allow_live.strip().lower() in ("1", "true", "yes"),
         }
+
+    mon: dict[str, Any] = {}
+    if host := os.environ.get("TRADER_CONTROL_HOST"):
+        mon["api_host"] = host
+    if port := os.environ.get("TRADER_CONTROL_PORT"):
+        try:
+            mon["api_port"] = int(port)
+        except ValueError:
+            pass
+    if webhook := os.environ.get("TRADER_ALERT_WEBHOOK"):
+        mon["webhook_url"] = webhook.strip() or None
+    if stale := os.environ.get("TRADER_HEARTBEAT_STALE_SECONDS"):
+        try:
+            mon["heartbeat_stale_seconds"] = float(stale)
+        except ValueError:
+            pass
+    if mon:
+        overrides["monitoring"] = mon
 
     return overrides
 
