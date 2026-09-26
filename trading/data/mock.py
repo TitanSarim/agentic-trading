@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
+from trading.data.scenarios import synthesize_trend_pullback_bars
 from trading.types import Bar, Timeframe, utc_now
+
+ScenarioName = Literal["flat", "trend_pullback"]
 
 
 class MockMarketData:
@@ -15,6 +19,8 @@ class MockMarketData:
         *,
         symbols: list[str] | None = None,
         base_prices: dict[str, float] | None = None,
+        scenario: ScenarioName = "flat",
+        seed: int = 42,
     ) -> None:
         self.symbols = symbols or ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
         self.base_prices = base_prices or {
@@ -23,15 +29,26 @@ class MockMarketData:
             "USDJPY": 150.00,
             "XAUUSD": 2400.0,
         }
+        self.scenario = scenario
+        self.seed = seed
         self._bars: dict[tuple[str, Timeframe], list[Bar]] = {}
 
-    def seed(
+    def seed_bars(
         self,
         symbol: str,
         timeframe: Timeframe,
         bars: list[Bar],
     ) -> None:
         self._bars[(symbol, timeframe)] = list(bars)
+
+    # Back-compat alias used by older tests / callers.
+    def seed(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        bars: list[Bar],
+    ) -> None:
+        self.seed_bars(symbol, timeframe, bars)
 
     def get_bars(
         self,
@@ -69,6 +86,19 @@ class MockMarketData:
         return age <= max_age_seconds
 
     def _synthesize(self, symbol: str, timeframe: Timeframe, count: int) -> list[Bar]:
+        if self.scenario == "trend_pullback":
+            return synthesize_trend_pullback_bars(
+                symbol,
+                timeframe,
+                count=count,
+                base_price=self.base_prices.get(symbol),
+                seed=self.seed + hash((symbol, timeframe.value)) % 10_000,
+            )
+        return self._synthesize_flat(symbol, timeframe, count)
+
+    def _synthesize_flat(
+        self, symbol: str, timeframe: Timeframe, count: int
+    ) -> list[Bar]:
         step = timedelta(minutes=5 if timeframe == Timeframe.M5 else 15)
         px = self.base_prices.get(symbol, 1.0)
         now = utc_now().replace(second=0, microsecond=0)

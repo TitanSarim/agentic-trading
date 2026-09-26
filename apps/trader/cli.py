@@ -1,6 +1,6 @@
-"""Minimal trader CLI — health, config-print, migrate, download-bars, ollama-tags.
+"""Trader CLI — health, migrate, download-bars, backtest, ollama-tags.
 
-No live order placement in Phase 1.
+No live order placement. Backtests are offline (mock/sample bars only).
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import yaml
 from rich.console import Console
 
 from brokers.factory import create_broker
+from research.backtest import BacktestConfig, Backtester
+from research.costs import CostConfig, CostModel
 from trading.config import load_settings
 from trading.data.historical import HistoricalDownloader
 from trading.data.mock import MockMarketData
@@ -22,10 +24,12 @@ from trading.journal.db import JournalDB
 from trading.llm.factory import create_llm
 from trading.logging_setup import configure_logging, get_logger
 from trading.risk.engine import RiskEngine
+from trading.strategies.trend_pullback import TrendPullbackConfig, TrendPullbackStrategy
+from trading.types import Timeframe
 
 app = typer.Typer(
     name="trader",
-    help="Agentic trading foundation CLI (Phase 1). No live trades.",
+    help="Agentic trading CLI (Phase 2 research). No live trades.",
     add_completion=False,
 )
 console = Console()
@@ -127,7 +131,7 @@ def health(ctx: typer.Context) -> None:
 
     if not ok:
         raise typer.Exit(code=1)
-    console.print("[green]health ok[/green] (Phase 1 foundation)")
+    console.print("[green]health ok[/green] (Phase 2 research foundation)")
 
 
 @app.command("ollama-tags")
@@ -205,17 +209,27 @@ def demo_roundtrip(ctx: typer.Context) -> None:
     broker.connect()
     account = broker.account_state()
 
-    candidate = TradeCandidate(
-        symbol="EURUSD",
-        strategy="stub_v0",
-        direction="LONG",
-        entry=1.1000,
-        stop=1.0980,
-        target=1.1040,
-        risk_reward=2.0,
-        regime="trend",
-        setup_score=80,
-    )
+    # Prefer a real strategy candidate when synthetic bars allow; else stub.
+    market = MockMarketData(scenario="trend_pullback")
+    bars = market.get_bars("EURUSD", Timeframe.M5, count=120)
+    strategy = TrendPullbackStrategy(_strategy_cfg(settings))
+    candidate = None
+    for i in range(len(bars) - 1, 20, -1):
+        candidate = strategy.evaluate("EURUSD", bars, at_index=i)
+        if candidate is not None:
+            break
+    if candidate is None:
+        candidate = TradeCandidate(
+            symbol="EURUSD",
+            strategy="trend_pullback_v1",
+            direction="LONG",
+            entry=1.1000,
+            stop=1.0980,
+            target=1.1040,
+            risk_reward=2.0,
+            regime="trend",
+            setup_score=80,
+        )
     cid = db.record_candidate(candidate)
 
     llm = MockLlm()
@@ -236,7 +250,7 @@ def demo_roundtrip(ctx: typer.Context) -> None:
             volume=decision.volume,
             stop_loss=candidate.stop,
             take_profit=candidate.target,
-            client_order_id=f"p1-demo-{cid}",
+            client_order_id=f"p2-demo-{cid}",
         )
         result = broker.submit_order(order)
 
@@ -248,15 +262,130 @@ def demo_roundtrip(ctx: typer.Context) -> None:
             "analyst": analyst.decision,
             "risk_approved": decision.approved,
             "order_status": result.status.value if result else None,
+            "strategy": candidate.strategy,
         },
     )
     db.close()
     console.print(
         {
+            "candidate": candidate.model_dump(),
             "analyst": analyst.model_dump(),
             "risk": decision.model_dump(),
             "order": result.model_dump() if result else None,
         }
+    )
+
+
+@app.command("backtest")
+def backtest(
+    ctx: typer.Context,
+    symbol: Optional[str] = typer.Option(
+        None,
+        "--symbol",
+        "-s",
+        help="Symbol (default: all universe symbols)",
+    ),
+    timeframe: str = typer.Option(
+        "M5",
+        "--timeframe",
+        "-t",
+        help="M5 or M15",
+    ),
+    bars: Optional[int] = typer.Option(
+        None,
+        "--bars",
+        "-n",
+        help="Synthetic bars to generate (default from config)",
+    ),
+    json_out: bool = typer.Option(
+        False,
+        "--json",
+        help="Print machine-readable JSON only",
+    ),
+) -> None:
+    """Run offline backtest with costs on synthetic trend_pullback bars.
+
+    No live broker, no real-money orders. Cloud-safe.
+    """
+    settings = ctx.obj["settings"]
+    if timeframe not in ("M5", "M15"):
+        console.print("[red]timeframe must be M5 or M15[/red]")
+        raise typer.Exit(code=1)
+
+    symbols = [symbol] if symbol else list(settings.universe.symbols)
+    count = bars or settings.backtest.default_bars
+    tf = Timeframe(timeframe)
+
+    strategy = TrendPullbackStrategy(_strategy_cfg(settings))
+    costs = CostModel(
+        CostConfig(
+            commission_per_lot=settings.costs.commission_per_lot,
+            slippage_pips=settings.costs.slippage_pips,
+            swap_per_lot_per_day=settings.costs.swap_per_lot_per_day,
+        )
+    )
+    engine = Backtester(
+        strategy=strategy,
+        costs=costs,
+        config=BacktestConfig(
+            volume=settings.backtest.volume,
+            max_hold_bars=settings.backtest.max_hold_bars,
+            one_position=settings.backtest.one_position,
+        ),
+    )
+
+    market = MockMarketData(
+        symbols=symbols,
+        scenario=settings.backtest.scenario,
+    )
+    reports = []
+    for sym in symbols:
+        series = market.get_bars(sym, tf, count=count)
+        report = engine.run(sym, tf, series)
+        reports.append(report)
+
+    payload = {
+        "strategy": strategy.name,
+        "scenario": settings.backtest.scenario,
+        "bars": count,
+        "timeframe": timeframe,
+        "reports": [r.to_dict() for r in reports],
+    }
+
+    db = JournalDB(settings.database.path)
+    db.migrate()
+    db.record_system_event("backtest_complete", payload)
+    db.close()
+
+    if json_out:
+        console.print_json(data=payload)
+    else:
+        console.print(
+            f"[bold]strategy[/bold]={strategy.name}  "
+            f"[bold]scenario[/bold]={settings.backtest.scenario}  "
+            f"[bold]bars[/bold]={count}  [bold]tf[/bold]={timeframe}"
+        )
+        for r in reports:
+            console.print(r.to_dict())
+        console.print(
+            "[dim]Offline research only — not live performance. "
+            "Risk engine / Qwen boundaries unchanged.[/dim]"
+        )
+
+
+def _strategy_cfg(settings: object) -> TrendPullbackConfig:
+    s = settings.strategy  # type: ignore[attr-defined]
+    return TrendPullbackConfig(
+        ema_fast=s.ema_fast,
+        ema_slow=s.ema_slow,
+        atr_period=s.atr_period,
+        rsi_period=s.rsi_period,
+        swing_lookback=s.swing_lookback,
+        pullback_atr_frac=s.pullback_atr_frac,
+        stop_atr_mult=s.stop_atr_mult,
+        risk_reward=s.risk_reward,
+        min_setup_score=s.min_setup_score,
+        ema_touch_atr_frac=s.ema_touch_atr_frac,
     )
 
 

@@ -24,6 +24,9 @@ def test_default_settings_locked_values(tmp_path: Path, monkeypatch: pytest.Monk
     assert settings.risk.allow_llm_increase_risk is False
     assert settings.mt5.account_mode == "demo"
     assert settings.broker.backend == "mock"
+    assert settings.strategy.name == "trend_pullback_v1"
+    assert settings.costs.commission_per_lot == 7.0
+    assert settings.backtest.scenario == "trend_pullback"
 
 
 def test_env_overrides_ollama_url(monkeypatch: pytest.MonkeyPatch) -> None:

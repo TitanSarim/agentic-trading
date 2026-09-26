@@ -43,3 +43,29 @@ logging:
 broker:
   # mock | mt5 — mt5 requires MetaTrader5 Python on Windows next to terminal64.exe
   backend: "mock"
+
+# Phase 2 — research strategy + costs (offline backtests only)
+strategy:
+  name: "trend_pullback_v1"
+  ema_fast: 8
+  ema_slow: 21
+  atr_period: 14
+  rsi_period: 14
+  swing_lookback: 5
+  pullback_atr_frac: 0.6
+  stop_atr_mult: 1.5
+  risk_reward: 2.0
+  min_setup_score: 50.0
+  ema_touch_atr_frac: 0.35
+
+costs:
+  commission_per_lot: 7.0
+  slippage_pips: 0.5
+  swap_per_lot_per_day: 0.0
+
+backtest:
+  volume: 0.10
+  max_hold_bars: 48
+  one_position: true
+  default_bars: 400
+  scenario: "trend_pullback"  # synthetic offline scenario; not live data

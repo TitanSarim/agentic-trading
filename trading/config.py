@@ -81,6 +81,38 @@ class BrokerSettings(BaseModel):
     backend: Literal["mock", "mt5"] = "mock"
 
 
+class StrategySettings(BaseModel):
+    """V1 research strategy: trend_pullback_v1 (deterministic)."""
+
+    name: str = "trend_pullback_v1"
+    ema_fast: int = 8
+    ema_slow: int = 21
+    atr_period: int = 14
+    rsi_period: int = 14
+    swing_lookback: int = 5
+    pullback_atr_frac: float = 0.6
+    stop_atr_mult: float = 1.5
+    risk_reward: float = 2.0
+    min_setup_score: float = 50.0
+    ema_touch_atr_frac: float = 0.35
+
+
+class CostSettings(BaseModel):
+    """Research cost model — spread/commission/slippage/swap."""
+
+    commission_per_lot: float = 7.0
+    slippage_pips: float = 0.5
+    swap_per_lot_per_day: float = 0.0
+
+
+class BacktestSettings(BaseModel):
+    volume: float = 0.10
+    max_hold_bars: int = 48
+    one_position: bool = True
+    default_bars: int = 400
+    scenario: Literal["flat", "trend_pullback"] = "trend_pullback"
+
+
 class Settings(BaseModel):
     ollama: OllamaSettings = Field(default_factory=OllamaSettings)
     mt5: Mt5Settings = Field(default_factory=Mt5Settings)
@@ -90,6 +122,9 @@ class Settings(BaseModel):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     broker: BrokerSettings = Field(default_factory=BrokerSettings)
+    strategy: StrategySettings = Field(default_factory=StrategySettings)
+    costs: CostSettings = Field(default_factory=CostSettings)
+    backtest: BacktestSettings = Field(default_factory=BacktestSettings)
     config_path: str | None = None
 
     @property

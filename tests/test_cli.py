@@ -35,3 +35,11 @@ def test_health_and_demo_roundtrip(tmp_path: Path, monkeypatch) -> None:
 
     tags = runner.invoke(app, ["ollama-tags"])
     assert tags.exit_code == 2  # unreachable — skippable in CI
+
+    bt = runner.invoke(
+        app,
+        ["backtest", "--symbol", "EURUSD", "--timeframe", "M5", "--bars", "250", "--json"],
+    )
+    assert bt.exit_code == 0
+    assert "trend_pullback_v1" in bt.stdout
+    assert "expectancy" in bt.stdout
