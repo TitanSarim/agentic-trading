@@ -66,6 +66,16 @@ pytest
 trader walk-forward --bars 400 --json
 trader soak --ticks 20 --json
 trader validate --bars 400 --ticks 20
+trader validate-demo --no-pytest --json   # offline + records LAN BLOCKED on cloud
+```
+
+### Windows LAN (fill Ollama / MT5 rows)
+
+```powershell
+# After MT5 demo terminal is logged in and .22 is reachable:
+.\scripts\windows-demo-validation.ps1
+# Optional one tiny demo fill after dry-run OK:
+.\scripts\windows-demo-validation.ps1 -SubmitTiny
 ```
 
 ## IC Markets demo on Windows
@@ -96,12 +106,14 @@ Resolution: **defaults < `config/default.yaml` < environment** (env wins).
 | Command | Purpose |
 |---------|---------|
 | `trader validate` | Walk-forward + stress + soak → DoD JSON/MD |
+| `trader validate-demo` | Full demo checklist (offline + LAN probes) → `reports/demo-validation.*` |
 | `trader walk-forward` | Chronological OOS folds |
 | `trader stress` | Spread / slippage / gap / consecutive-loss shocks |
 | `trader soak` | Accelerated offline soak (halt/kill/heartbeats) |
 | `trader health` / `status` / `halt` / `resume` / `kill` | Ops + monitoring |
 | `trader execute-demo` | Demo path (dry-run default) |
 | `trader backtest` / `scan` / `analyze` | Research / analyst |
+| `scripts/windows-demo-validation.ps1` | Copy-paste Windows LAN fill-in for Ollama/MT5 rows |
 
 ## Layout
 
