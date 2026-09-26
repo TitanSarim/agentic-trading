@@ -17,6 +17,10 @@ from rich.console import Console
 from brokers.factory import create_broker
 from research.backtest import BacktestConfig, Backtester
 from research.costs import CostConfig, CostModel
+from research.demo_validation import (
+    run_demo_validation,
+    write_demo_validation_report,
+)
 from research.dod_report import build_dod_report, write_dod_report
 from research.soak import SoakConfig, run_soak
 from research.stress import run_stress_suite
@@ -1439,6 +1443,84 @@ def validate_cmd(
         )
 
     if not dod.overall_passed:
+        raise typer.Exit(code=1)
+
+
+@app.command("validate-demo")
+def validate_demo_cmd(
+    ctx: typer.Context,
+    symbol: str = typer.Option("EURUSD", "--symbol", "-s"),
+    timeframe: str = typer.Option("M5", "--timeframe", "-t"),
+    bars: Optional[int] = typer.Option(None, "--bars", "-n"),
+    ticks: Optional[int] = typer.Option(None, "--ticks"),
+    run_tests: bool = typer.Option(
+        True,
+        "--pytest/--no-pytest",
+        help="Include pytest in the offline package (default: on)",
+    ),
+    probe_lan: bool = typer.Option(
+        True,
+        "--lan-probe/--no-lan-probe",
+        help="Attempt Ollama + MT5 reachability (records BLOCKED on cloud)",
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None, "--output-dir", "-o", help="Report directory (default reports/)"
+    ),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Full demo checklist: offline suite + optional LAN Ollama/MT5 probes.
+
+    Cloud-safe: offline PASS is enough for exit 0; LAN rows become BLOCKED when
+    192.168.8.22 / Windows MT5 are unreachable. On the Windows LAN host, the same
+    command fills live model and MT5 dry-run rows. No live/real-money orders.
+    """
+    settings = ctx.obj["settings"]
+    if timeframe not in ("M5", "M15"):
+        console.print("[red]timeframe must be M5 or M15[/red]")
+        raise typer.Exit(code=1)
+
+    out = output_dir or Path(settings.validation.report_dir)
+    report = run_demo_validation(
+        settings,
+        symbol=symbol,
+        timeframe=timeframe,
+        bars=bars,
+        ticks=ticks,
+        run_tests=run_tests,
+        probe_lan=probe_lan,
+        output_dir=out,
+    )
+    jp, mp = write_demo_validation_report(report, output_dir=out)
+
+    payload = report.to_dict()
+    payload["report_json"] = str(jp)
+    payload["report_md"] = str(mp)
+
+    if json_out:
+        console.print_json(data=payload)
+    else:
+        mark = (
+            "[green]PASS[/green]"
+            if report.offline_passed
+            else "[red]FAIL[/red]"
+        )
+        console.print(f"[bold]validate-demo[/bold] offline={mark}")
+        console.print(
+            f"LAN Ollama={'reachable' if report.lan_reachable else 'blocked'}  "
+            f"MT5={'available' if report.mt5_available else 'unavailable'}"
+        )
+        for c in report.checks:
+            console.print(
+                f"  [{c.status}] {c.id} ({c.scope}) — {c.evidence[:100]}"
+            )
+        console.print(f"wrote {jp}")
+        console.print(f"wrote {mp}")
+        console.print(
+            "[dim]No live/real-money path. Prefer dry-run; "
+            "--submit --confirm-demo only on Windows demo MT5 after dry-run OK.[/dim]"
+        )
+
+    if not report.offline_passed:
         raise typer.Exit(code=1)
 
 
