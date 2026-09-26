@@ -1,0 +1,45 @@
+# Default config for Windows app host → LAN Ollama.
+# Env overrides win: OLLAMA_BASE_URL, TRADER_CONFIG, etc.
+
+provider_url: "http://192.168.8.22:11434"  # alias for ollama.base_url
+
+ollama:
+  base_url: "http://192.168.8.22:11434"
+  screen_model: "qwen3.5:9b"
+  analyst_model: "qwen3.8:27b"
+  # alternate_analyst: "qwen3.6:27b"
+  temperature: 0.1
+  timeout_seconds: 30
+  fail_closed_on_error: true
+
+mt5:
+  terminal_path: "C:\\Program Files\\MetaTrader 5 IC Markets Global\\terminal64.exe"
+  broker: "IC Markets Global"
+  account_mode: "demo"  # flip to live only after Definition of Done
+
+universe:
+  symbols: ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
+  timeframes: ["M5", "M15"]
+
+risk:
+  risk_fraction_per_trade: 0.0035
+  max_positions: 1
+  daily_loss_lock_pct: 0.015
+  weekly_drawdown_lock_pct: 0.045
+  consecutive_loss_lock: 3
+  allow_llm_increase_risk: false
+
+execution:
+  require_attached_stop: true
+  idempotent_client_order_ids: true
+
+database:
+  path: "data/trader.db"
+
+logging:
+  level: "INFO"
+  json_logs: false
+
+broker:
+  # mock | mt5 — mt5 requires MetaTrader5 Python on Windows next to terminal64.exe
+  backend: "mock"
