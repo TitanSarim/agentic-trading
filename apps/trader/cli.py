@@ -29,7 +29,7 @@ from trading.types import Timeframe
 
 app = typer.Typer(
     name="trader",
-    help="Agentic trading CLI (Phase 2 research). No live trades.",
+    help="Agentic trading CLI (Phase 3 risk). No live trades.",
     add_completion=False,
 )
 console = Console()
@@ -108,9 +108,14 @@ def health(ctx: typer.Context) -> None:
         console.print(f"[red]broker[/red]: {exc}")
         log.exception("broker_health_failed")
 
-    # Risk stub boots
+    # Risk engine boots (boss; LLM cannot raise caps)
     RiskEngine(settings.risk)
-    console.print("[bold]risk[/bold]: engine stub loaded (boss; LLM cannot raise caps)")
+    console.print(
+        "[bold]risk[/bold]: engine loaded "
+        f"(max_pos={settings.risk.max_positions}, "
+        f"daily_lock={settings.risk.daily_loss_lock_pct}, "
+        "LLM cannot raise caps)"
+    )
 
     # Ollama optional — fail soft in health (cloud cannot reach .22)
     llm = create_llm(settings)
@@ -131,7 +136,7 @@ def health(ctx: typer.Context) -> None:
 
     if not ok:
         raise typer.Exit(code=1)
-    console.print("[green]health ok[/green] (Phase 2 research foundation)")
+    console.print("[green]health ok[/green] (Phase 3 risk engine)")
 
 
 @app.command("ollama-tags")
@@ -237,7 +242,36 @@ def demo_roundtrip(ctx: typer.Context) -> None:
     db.record_llm_decision(analyst, candidate_id=cid)
 
     risk = RiskEngine(settings.risk)
-    decision = risk.validate_and_size(candidate, analyst, account)
+    from datetime import timezone
+
+    from trading.risk.context import RiskMarketContext, RiskPortfolioContext
+
+    last_bar = bars[-1] if bars else None
+    bar_time = last_bar.time if last_bar else None
+    if bar_time is not None and bar_time.tzinfo is None:
+        bar_time = bar_time.replace(tzinfo=timezone.utc)
+    market_ctx = (
+        RiskMarketContext(
+            now=bar_time,
+            bar_time=bar_time,
+            spread=last_bar.spread if last_bar else 0.00012,
+        )
+        if bar_time is not None
+        else None
+    )
+    portfolio = RiskPortfolioContext(
+        day_start_equity=account.equity,
+        week_start_equity=account.equity,
+        consecutive_losses=0,
+        open_positions=[],
+    )
+    decision = risk.validate_and_size(
+        candidate,
+        analyst,
+        account,
+        market=market_ctx,
+        portfolio=portfolio,
+    )
     db.record_risk_decision(decision, candidate_id=cid)
 
     result = None
@@ -250,7 +284,7 @@ def demo_roundtrip(ctx: typer.Context) -> None:
             volume=decision.volume,
             stop_loss=candidate.stop,
             take_profit=candidate.target,
-            client_order_id=f"p2-demo-{cid}",
+            client_order_id=f"p3-demo-{cid}",
         )
         result = broker.submit_order(order)
 
@@ -324,6 +358,9 @@ def backtest(
             swap_per_lot_per_day=settings.costs.swap_per_lot_per_day,
         )
     )
+    risk_engine = None
+    if settings.backtest.use_risk_engine:
+        risk_engine = RiskEngine(settings.risk)
     engine = Backtester(
         strategy=strategy,
         costs=costs,
@@ -331,7 +368,10 @@ def backtest(
             volume=settings.backtest.volume,
             max_hold_bars=settings.backtest.max_hold_bars,
             one_position=settings.backtest.one_position,
+            use_risk_engine=settings.backtest.use_risk_engine,
+            starting_equity=settings.backtest.starting_equity,
         ),
+        risk=risk_engine,
     )
 
     market = MockMarketData(
@@ -349,6 +389,7 @@ def backtest(
         "scenario": settings.backtest.scenario,
         "bars": count,
         "timeframe": timeframe,
+        "use_risk_engine": settings.backtest.use_risk_engine,
         "reports": [r.to_dict() for r in reports],
     }
 
@@ -369,7 +410,7 @@ def backtest(
             console.print(r.to_dict())
         console.print(
             "[dim]Offline research only — not live performance. "
-            "Risk engine / Qwen boundaries unchanged.[/dim]"
+            "Risk engine sizes/rejects; Qwen cannot raise caps. No live orders.[/dim]"
         )
 
 

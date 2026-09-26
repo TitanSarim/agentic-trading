@@ -61,6 +61,22 @@ class RiskSettings(BaseModel):
     weekly_drawdown_lock_pct: float = 0.045
     consecutive_loss_lock: int = 3
     allow_llm_increase_risk: bool = False
+    # Phase 3 hard gates
+    max_data_age_seconds: float = 120.0
+    max_spread_pips: float | None = 3.0
+    min_volume: float = 0.01
+    volume_step: float = 0.01
+    max_volume: float = 1.0
+    forbid_averaging_down: bool = True
+    forbid_martingale: bool = True
+    apply_confidence_haircut: bool = False
+    # Optional overrides; empty → engine defaults for V1 symbols.
+    point_value_per_lot: dict[str, float] = Field(default_factory=dict)
+    pip_size: dict[str, float] = Field(default_factory=dict)
+    # Symbols that should not be held together (research correlation groups).
+    correlation_groups: list[list[str]] = Field(
+        default_factory=lambda: [["EURUSD", "GBPUSD"]]
+    )
 
 
 class ExecutionSettings(BaseModel):
@@ -111,6 +127,9 @@ class BacktestSettings(BaseModel):
     one_position: bool = True
     default_bars: int = 400
     scenario: Literal["flat", "trend_pullback"] = "trend_pullback"
+    # Phase 3: when True, RiskEngine sizes/rejects candidates in the sim.
+    use_risk_engine: bool = True
+    starting_equity: float = 1000.0
 
 
 class Settings(BaseModel):
