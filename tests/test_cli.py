@@ -28,6 +28,7 @@ def test_health_and_demo_roundtrip(tmp_path: Path, monkeypatch) -> None:
     health = runner.invoke(app, ["health"])
     assert health.exit_code == 0
     assert "health ok" in health.stdout
+    assert "Phase 5" in health.stdout
 
     demo = runner.invoke(app, ["demo-roundtrip"])
     assert demo.exit_code == 0
@@ -51,3 +52,28 @@ def test_health_and_demo_roundtrip(tmp_path: Path, monkeypatch) -> None:
     assert scan.exit_code == 0
     assert "opportunity_score" in scan.stdout
     assert "never opens a trade" in scan.stdout.lower() or "RiskEngine" in scan.stdout
+
+    analyze = runner.invoke(
+        app,
+        ["analyze", "--mock", "--symbol", "EURUSD", "--timeframe", "M5", "--json"],
+    )
+    assert analyze.exit_code == 0
+    assert "analyst" in analyze.stdout
+    assert "risk_modifier" in analyze.stdout
+
+    scan_analyze = runner.invoke(
+        app,
+        [
+            "scan",
+            "--symbol",
+            "EURUSD",
+            "--timeframe",
+            "M5",
+            "--bars",
+            "120",
+            "--analyze",
+            "--mock-llm",
+            "--json",
+        ],
+    )
+    assert scan_analyze.exit_code == 0

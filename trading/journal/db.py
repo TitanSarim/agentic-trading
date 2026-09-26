@@ -143,12 +143,17 @@ class JournalDB:
         *,
         candidate_id: int | None = None,
     ) -> int:
+        validated = decision.validated_response
+        validated_json = (
+            json.dumps(validated) if validated is not None else None
+        )
         cur = self._conn.execute(
             """
             INSERT INTO llm_decisions(
                 created_at, candidate_id, model, prompt_version, decision,
-                confidence, risk_modifier, reason_code, raw_response
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                confidence, risk_modifier, reason_code, raw_response,
+                input_hash, validated_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 utc_now().isoformat(),
@@ -160,6 +165,8 @@ class JournalDB:
                 decision.risk_modifier,
                 decision.reason_code,
                 decision.raw_response,
+                decision.input_hash,
+                validated_json,
             ),
         )
         self._conn.commit()

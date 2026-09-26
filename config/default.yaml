@@ -11,6 +11,8 @@ ollama:
   temperature: 0.1
   timeout_seconds: 30
   fail_closed_on_error: true
+  backend: "ollama"          # ollama | mock (CI: set OLLAMA_BACKEND=mock)
+  use_screen_model: false    # optional qwen3.5:9b pre-screen
 
 mt5:
   terminal_path: "C:\\Program Files\\MetaTrader 5 IC Markets Global\\terminal64.exe"
@@ -96,3 +98,4 @@ scanner:
   default_bars: 120
   scenario: "trend_pullback"
   evaluate_strategy: true
+  analyze_candidates: false  # optional Qwen/mock after strategy (P5; no orders)

@@ -70,4 +70,7 @@ def test_rejects_unknown_timeframe(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 def test_settings_model_defaults() -> None:
     s = Settings()
     assert s.ollama.fail_closed_on_error is True
+    assert s.ollama.backend == "ollama"
+    assert s.ollama.use_screen_model is False
+    assert s.scanner.analyze_candidates is False
     assert s.execution.require_attached_stop is True
