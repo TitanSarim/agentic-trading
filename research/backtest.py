@@ -1,19 +1,31 @@
-"""Offline backtest engine — deterministic strategy + cost model.
+"""Offline backtest engine — deterministic strategy + cost model + optional risk.
 
 No live orders. Entry fills on the *next* bar open after a signal on a closed
 bar (avoids same-bar look-ahead). Exits at stop / target using bar high/low
 with cost-adjusted prices.
+
+When a RiskEngine is attached, candidates are sized/rejected by risk (boss).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from research.costs import CostModel, CostConfig, side_from_direction
+from trading.risk.context import RiskMarketContext, RiskPortfolioContext
+from trading.risk.engine import RiskEngine
 from trading.strategies.trend_pullback import TrendPullbackConfig, TrendPullbackStrategy
-from trading.types import Bar, Side, Timeframe, TradeCandidate
+from trading.types import (
+    AccountState,
+    AnalystDecision,
+    Bar,
+    Position,
+    Side,
+    Timeframe,
+    TradeCandidate,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +47,7 @@ class BacktestTrade:
     bars_held: int
     exit_reason: str
     setup_score: float
+    risk_reason: str = "APPROVED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,10 +67,12 @@ class BacktestReport:
     avg_loss: float
     gross_profit: float
     gross_loss: float
+    risk_rejects: int = 0
+    ending_equity: float | None = None
     trade_list: list[BacktestTrade] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "symbol": self.symbol,
             "timeframe": self.timeframe,
             "strategy": self.strategy,
@@ -73,14 +88,25 @@ class BacktestReport:
             "avg_loss": round(self.avg_loss, 4),
             "gross_profit": round(self.gross_profit, 4),
             "gross_loss": round(self.gross_loss, 4),
+            "risk_rejects": self.risk_rejects,
         }
+        if self.ending_equity is not None:
+            out["ending_equity"] = round(self.ending_equity, 4)
+        return out
 
 
 @dataclass(frozen=True, slots=True)
 class BacktestConfig:
-    volume: float = 0.10  # fixed research size (risk engine not sizing here)
+    volume: float = 0.10  # fixed research size when risk engine is off
     max_hold_bars: int = 48
     one_position: bool = True
+    use_risk_engine: bool = False
+    starting_equity: float = 1000.0
+    # Research backtests treat analyst as APPROVE with full modifier.
+    analyst_risk_modifier: float = 1.0
+    # Freshness: treat signal bar as "now" so historical replay is not stale.
+    # Set max_data_age_seconds on RiskSettings; we pass bar_time == now.
+    respect_spread_gate: bool = True
 
 
 class Backtester:
@@ -92,10 +118,12 @@ class Backtester:
         strategy: TrendPullbackStrategy | None = None,
         costs: CostModel | None = None,
         config: BacktestConfig | None = None,
+        risk: RiskEngine | None = None,
     ) -> None:
         self.strategy = strategy or TrendPullbackStrategy()
         self.costs = costs or CostModel()
         self.config = config or BacktestConfig()
+        self.risk = risk
 
     def run(
         self,
@@ -105,6 +133,13 @@ class Backtester:
     ) -> BacktestReport:
         tf = timeframe.value if isinstance(timeframe, Timeframe) else str(timeframe)
         trades: list[BacktestTrade] = []
+        risk_rejects = 0
+        equity = self.config.starting_equity
+        day_start = equity
+        week_start = equity
+        consecutive_losses = 0
+        open_positions: list[Position] = []
+
         i = 0
         n = len(bars)
         while i < n - 1:
@@ -112,6 +147,26 @@ class Backtester:
             if candidate is None:
                 i += 1
                 continue
+
+            volume = self.config.volume
+            risk_reason = "FIXED_VOLUME"
+            if self.config.use_risk_engine and self.risk is not None:
+                decision = self._risk_decide(
+                    candidate=candidate,
+                    signal_bar=bars[i],
+                    equity=equity,
+                    day_start=day_start,
+                    week_start=week_start,
+                    consecutive_losses=consecutive_losses,
+                    open_positions=open_positions,
+                )
+                if not decision.approved:
+                    risk_rejects += 1
+                    i += 1
+                    continue
+                volume = decision.volume
+                risk_reason = decision.reason_code
+
             entry_i = i + 1
             if entry_i >= n:
                 break
@@ -122,14 +177,90 @@ class Backtester:
                 signal_index=i,
                 entry_index=entry_i,
                 candidate=candidate,
+                volume=volume,
+                risk_reason=risk_reason,
             )
             if trade is not None:
                 trades.append(trade)
+                equity += trade.pnl
+                if trade.pnl < 0:
+                    consecutive_losses += 1
+                else:
+                    consecutive_losses = 0
+                if self.risk is not None:
+                    self.risk.record_closed_trade(trade.pnl)
                 if self.config.one_position:
                     i = trade.exit_index + 1
                     continue
             i += 1
-        return _build_report(symbol, tf, self.strategy.name, trades)
+        report = _build_report(symbol, tf, self.strategy.name, trades)
+        return BacktestReport(
+            symbol=report.symbol,
+            timeframe=report.timeframe,
+            strategy=report.strategy,
+            trades=report.trades,
+            wins=report.wins,
+            losses=report.losses,
+            win_rate=report.win_rate,
+            expectancy=report.expectancy,
+            profit_factor=report.profit_factor,
+            max_drawdown=report.max_drawdown,
+            net_pnl=report.net_pnl,
+            avg_win=report.avg_win,
+            avg_loss=report.avg_loss,
+            gross_profit=report.gross_profit,
+            gross_loss=report.gross_loss,
+            risk_rejects=risk_rejects,
+            ending_equity=equity if self.config.use_risk_engine else None,
+            trade_list=report.trade_list,
+        )
+
+    def _risk_decide(
+        self,
+        *,
+        candidate: TradeCandidate,
+        signal_bar: Bar,
+        equity: float,
+        day_start: float,
+        week_start: float,
+        consecutive_losses: int,
+        open_positions: list[Position],
+    ):
+        assert self.risk is not None
+        account = AccountState(
+            balance=equity,
+            equity=equity,
+            account_mode="demo",
+        )
+        portfolio = RiskPortfolioContext(
+            day_start_equity=day_start,
+            week_start_equity=week_start,
+            consecutive_losses=consecutive_losses,
+            open_positions=list(open_positions),
+        )
+        # Historical replay: bar_time == now so freshness gate passes;
+        # live path must pass wall-clock now vs bar time.
+        bar_time = signal_bar.time
+        if bar_time.tzinfo is None:
+            bar_time = bar_time.replace(tzinfo=timezone.utc)
+        market = RiskMarketContext(
+            now=bar_time,
+            bar_time=bar_time,
+            spread=signal_bar.spread if self.config.respect_spread_gate else None,
+        )
+        analyst = AnalystDecision(
+            decision="APPROVE",
+            confidence=1.0,
+            risk_modifier=self.config.analyst_risk_modifier,
+            reason_code="BACKTEST",
+        )
+        return self.risk.validate_and_size(
+            candidate,
+            analyst,
+            account,
+            market=market,
+            portfolio=portfolio,
+        )
 
     def _simulate_trade(
         self,
@@ -140,6 +271,8 @@ class Backtester:
         signal_index: int,
         entry_index: int,
         candidate: TradeCandidate,
+        volume: float,
+        risk_reason: str,
     ) -> BacktestTrade | None:
         side = side_from_direction(candidate.direction)
         entry_bar = bars[entry_index]
@@ -160,7 +293,6 @@ class Backtester:
             stop = entry + risk
             target = entry - self.strategy.config.risk_reward * risk
 
-        volume = self.config.volume
         last_i = min(len(bars) - 1, entry_index + self.config.max_hold_bars)
         exit_price = entry
         exit_i = last_i
@@ -225,6 +357,7 @@ class Backtester:
             bars_held=hold,
             exit_reason=exit_reason,
             setup_score=candidate.setup_score,
+            risk_reason=risk_reason,
         )
 
 
@@ -310,11 +443,13 @@ def run_universe_backtest(
     strategy_config: TrendPullbackConfig | None = None,
     cost_config: CostConfig | None = None,
     backtest_config: BacktestConfig | None = None,
+    risk: RiskEngine | None = None,
 ) -> list[BacktestReport]:
     bt = Backtester(
         strategy=TrendPullbackStrategy(strategy_config),
         costs=CostModel(cost_config),
         config=backtest_config or BacktestConfig(),
+        risk=risk,
     )
     reports: list[BacktestReport] = []
     for (symbol, tf), bars in sorted(bars_by_key.items()):

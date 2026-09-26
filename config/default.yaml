@@ -28,6 +28,17 @@ risk:
   weekly_drawdown_lock_pct: 0.045
   consecutive_loss_lock: 3
   allow_llm_increase_risk: false
+  # Phase 3 hard gates
+  max_data_age_seconds: 120
+  max_spread_pips: 3.0
+  min_volume: 0.01
+  volume_step: 0.01
+  max_volume: 1.0
+  forbid_averaging_down: true
+  forbid_martingale: true
+  apply_confidence_haircut: false
+  correlation_groups:
+    - ["EURUSD", "GBPUSD"]
 
 execution:
   require_attached_stop: true
@@ -69,3 +80,5 @@ backtest:
   one_position: true
   default_bars: 400
   scenario: "trend_pullback"  # synthetic offline scenario; not live data
+  use_risk_engine: true       # size/reject via RiskEngine (P3)
+  starting_equity: 1000.0

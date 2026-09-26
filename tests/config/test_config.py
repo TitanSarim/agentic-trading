@@ -22,11 +22,16 @@ def test_default_settings_locked_values(tmp_path: Path, monkeypatch: pytest.Monk
     assert settings.universe.timeframes == ["M5", "M15"]
     assert settings.universe.symbols == ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
     assert settings.risk.allow_llm_increase_risk is False
+    assert settings.risk.max_positions == 1
+    assert settings.risk.forbid_averaging_down is True
+    assert settings.risk.forbid_martingale is True
+    assert settings.risk.max_data_age_seconds == 120
     assert settings.mt5.account_mode == "demo"
     assert settings.broker.backend == "mock"
     assert settings.strategy.name == "trend_pullback_v1"
     assert settings.costs.commission_per_lot == 7.0
     assert settings.backtest.scenario == "trend_pullback"
+    assert settings.backtest.use_risk_engine is True
 
 
 def test_env_overrides_ollama_url(monkeypatch: pytest.MonkeyPatch) -> None:
