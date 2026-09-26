@@ -1,7 +1,7 @@
 [project]
 name = "agentic-trading"
 version = "0.1.0"
-description = "Autonomous Qwen + Ollama + MT5 trading system (Phase 3 risk)"
+description = "Autonomous Qwen + Ollama + MT5 trading system (Phase 4 scanner)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

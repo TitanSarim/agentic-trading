@@ -191,6 +191,58 @@ class JournalDB:
         self._conn.commit()
         return int(cur.lastrowid)
 
+    def record_opportunity_score(self, market: Any) -> int:
+        """Persist one scanner row (ScannedMarket-like)."""
+        components = getattr(market, "components", None)
+        comps = components.as_dict() if components is not None else {}
+        cur = self._conn.execute(
+            """
+            INSERT INTO opportunity_scores(
+                created_at, symbol, timeframe, eligible, reason_code,
+                opportunity_score, rank, selected_for_strategy,
+                trend_score, volatility_score, momentum_score, setup_quality,
+                liquidity_score, spread_penalty, abnormal_volatility_penalty,
+                correlation_penalty, regime, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                utc_now().isoformat(),
+                market.symbol,
+                market.timeframe.value
+                if hasattr(market.timeframe, "value")
+                else str(market.timeframe),
+                1 if market.eligible else 0,
+                market.reason_code,
+                market.opportunity_score,
+                market.rank,
+                1 if market.selected_for_strategy else 0,
+                comps.get("trend_score"),
+                comps.get("volatility_score"),
+                comps.get("momentum_score"),
+                comps.get("setup_quality"),
+                comps.get("liquidity_score"),
+                comps.get("spread_penalty"),
+                comps.get("abnormal_volatility_penalty"),
+                comps.get("correlation_penalty"),
+                getattr(market, "regime", None),
+                json.dumps(
+                    market.to_dict() if hasattr(market, "to_dict") else comps
+                ),
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def record_scan_report(self, report: Any) -> list[int]:
+        """Persist all markets from a ScanReport; return row ids."""
+        return [self.record_opportunity_score(m) for m in report.markets]
+
+    def count_opportunity_scores(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM opportunity_scores"
+        ).fetchone()
+        return int(row[0])
+
     def record_account_snapshot(self, account: AccountState) -> int:
         cur = self._conn.execute(
             """
