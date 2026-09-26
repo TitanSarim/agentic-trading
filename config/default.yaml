@@ -45,6 +45,7 @@ risk:
 execution:
   require_attached_stop: true
   idempotent_client_order_ids: true
+  allow_live: false  # P6 demo-only; live only after Definition of Done (P9)
 
 database:
   path: "data/trader.db"
@@ -56,6 +57,7 @@ logging:
 broker:
   # mock | mt5 — mt5 requires MetaTrader5 Python on Windows next to terminal64.exe
   backend: "mock"
+  mode: "demo"  # demo required for P6; refuse live unless allow_live (P9)
 
 # Phase 2 — research strategy + costs (offline backtests only)
 strategy:

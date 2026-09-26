@@ -1,12 +1,12 @@
-# Agentic Trading — Phase 5 Qwen / Ollama
+# Agentic Trading — Phase 6 demo execution (IC Markets)
 
-Python trading-app scaffold for the Autonomous Qwen + Ollama + MT5 (IC Markets) system.
+Python trading app for the Autonomous Qwen + Ollama + MT5 (IC Markets) system.
 
 **Authority:** Risk engine = boss. Qwen = analyst only. Strategy = setup generator. Broker = executor.
 
 **Host:** Windows machine co-located with MT5. Models live on Linux `192.168.8.22` Ollama.
 
-Phase 5 wires the **Qwen analyst** against Ollama with strict JSON schema, timeouts, fail-closed rejects, and journaled decisions. `risk_modifier` may **only reduce** size. **No live trades.**
+Phase 6 wires **demo order lifecycle** on IC Markets via MetaTrader5 Python: idempotent client order IDs, mandatory SL/TP, reconcile vs journal, and `trader execute-demo` (dry-run by default). **No live/real-money path** (`execution.allow_live=false`).
 
 ## Quick start (Windows)
 
@@ -16,32 +16,17 @@ cd path\to\agentic-trading
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-# or: uv sync
+# On the MT5 host only, also:
+pip install MetaTrader5
+# or: pip install -e ".[mt5]"
 
 copy .env.example .env
 
 trader health
-trader config-print
 trader migrate
-trader download-bars --count 100
-trader backtest --symbol EURUSD --timeframe M5 --bars 400
-trader scan --symbol EURUSD --timeframe M5
+trader execute-demo --backend mock --dry-run --json
 trader analyze --mock --json
-trader demo-roundtrip
-
-# Optional — only when this Windows host can reach .22:
-trader ollama-tags
-trader analyze --live --json
-curl -s http://192.168.8.22:11434/api/tags
-```
-
-With `uv`:
-
-```powershell
-uv sync
-uv run trader health
-uv run trader analyze --mock --json
-uv run pytest
+trader scan --symbol EURUSD -t M5 --json
 ```
 
 ## Offline tests (CI / cloud)
@@ -49,112 +34,125 @@ uv run pytest
 ```powershell
 pip install -e ".[dev]"
 pytest
-# or: uv run pytest
-
-trader analyze --mock --json
-trader scan --symbol EURUSD -t M5 --analyze --mock-llm --json
+trader execute-demo --backend mock --dry-run --json
+trader execute-demo --backend mock --submit --confirm-demo --mock-llm --json
 ```
 
-All default tests mock the LLM — no LAN/Ollama/MT5 required.
+Cloud has no MT5 — tests use `MockBroker`. Never import MetaTrader5 unless on Windows.
+
+## IC Markets demo on Windows
+
+1. Start the terminal and log into a **demo** account:
+
+```text
+C:\Program Files\MetaTrader 5 IC Markets Global\terminal64.exe
+```
+
+2. Install MetaTrader5 Python next to the app:
+
+```powershell
+pip install MetaTrader5
+```
+
+3. Optional credentials in `.env` (never commit secrets):
+
+```powershell
+$env:TRADER_BROKER_BACKEND = "mt5"
+$env:TRADER_BROKER_MODE = "demo"
+# Optional if not already logged in via terminal UI:
+# $env:MT5_LOGIN = "..."
+# $env:MT5_PASSWORD = "..."
+# $env:MT5_SERVER = "ICMarketsSC-Demo"
+```
+
+4. Dry-run (no order sent):
+
+```powershell
+trader execute-demo --backend mt5 --dry-run --json
+```
+
+5. Submit on **demo only** (explicit confirm required):
+
+```powershell
+trader execute-demo --backend mt5 --submit --confirm-demo --json
+```
+
+`--submit` without `--confirm-demo` is rejected. Live mode is refused unless `execution.allow_live=true` (Phase 9 — not enabled by default).
 
 ## Optional live Ollama (Windows LAN only)
 
 ```powershell
 $env:OLLAMA_BASE_URL = "http://192.168.8.22:11434"
 trader ollama-tags
-trader analyze --live --symbol EURUSD --timeframe M5 --json
+trader analyze --live --json
+trader execute-demo --backend mock --dry-run --live-llm --json
 ```
 
-Cloud Cursor agents **cannot** reach `192.168.8.22`. Exit code `2` from `ollama-tags` / `analyze --live` means unreachable — skippable without LAN.
+Cloud agents **cannot** reach `192.168.8.22`.
 
 ## Configuration
 
-Resolution order: **built-in defaults < `config/default.yaml` < environment** (env wins).
+Resolution: **defaults < `config/default.yaml` < environment** (env wins).
 
 | Key / env | Default | Notes |
 |-----------|---------|--------|
-| `OLLAMA_BASE_URL` / `ollama.base_url` / `provider_url` | `http://192.168.8.22:11434` | Env preferred for overrides |
-| `ollama.analyst_model` | `qwen3.8:27b` | Locked primary |
-| `ollama.screen_model` | `qwen3.5:9b` | Optional screener |
-| `ollama.use_screen_model` | `false` | Optional 9b pre-screen |
-| `ollama.backend` / `OLLAMA_BACKEND` | `ollama` | Use `mock` in CI |
-| `ollama.timeout_seconds` | `30` | Fail-closed on timeout |
-| `ollama.fail_closed_on_error` | `true` | Errors → REJECT / no boost |
-| `scanner.analyze_candidates` | `false` | Optional analyze after scan |
-| `universe.timeframes` | `M5`, `M15` | Locked |
-| `risk.allow_llm_increase_risk` | `false` | Hard-locked |
 | `broker.backend` / `TRADER_BROKER_BACKEND` | `mock` | `mt5` only on Windows |
-| `mt5.account_mode` | `demo` | Live only after Definition of Done |
-
-## Topology
-
-```text
-Windows: trading app + MT5 terminal64.exe
-    --HTTP-->  http://192.168.8.22:11434  (Ollama + Qwen)
-
-Cloud Cursor agents cannot reach .22 or MT5.
-Use mocks in CI; run ollama-tags / analyze --live on the Windows LAN host.
-```
+| `broker.mode` / `TRADER_BROKER_MODE` | `demo` | Synced with `mt5.account_mode` |
+| `execution.allow_live` / `TRADER_ALLOW_LIVE` | `false` | P6 refuses live |
+| `execution.require_attached_stop` | `true` | SL + TP required |
+| `mt5.terminal_path` | IC Markets Global `terminal64.exe` | Locked path |
+| `OLLAMA_BASE_URL` | `http://192.168.8.22:11434` | Env preferred |
+| `ollama.analyst_model` | `qwen3.8:27b` | Locked primary |
 
 ## CLI
 
 | Command | Purpose |
 |---------|---------|
-| `trader health` | Config, DB, mock broker, optional Ollama ping |
-| `trader config-print` | Dump resolved settings |
-| `trader migrate` | Apply SQLite migrations |
-| `trader download-bars` | Synthetic historical bars → `market_bars` |
-| `trader backtest` | Offline strategy backtest with costs |
-| `trader scan` | Eligibility + opportunity ranking (+ optional `--analyze`) |
-| `trader analyze` | Dry analyst call (`--mock` default; `--live` on LAN) |
-| `trader demo-roundtrip` | Strategy → mock LLM → risk → mock fill |
-| `trader ollama-tags` | List models if URL reachable (exit 2 if not) |
+| `trader health` | Config, DB, mock broker, optional Ollama |
+| `trader execute-demo` | Demo path: dry-run default; `--submit --confirm-demo` |
+| `trader analyze` | Dry analyst (`--mock` / `--live`) |
+| `trader scan` | Eligibility + ranking (+ optional `--analyze`) |
+| `trader backtest` | Offline strategy backtest |
+| `trader demo-roundtrip` | Legacy mock fill smoke |
+| `trader ollama-tags` | List models if reachable (exit 2 if not) |
 
 ## Layout
 
 ```text
-apps/trader/          CLI entrypoint
-brokers/              BrokerPort, MockBroker, Mt5Broker stub
+apps/trader/          CLI
+brokers/              BrokerPort, MockBroker, Mt5Broker (Windows)
 trading/
-  config.py           YAML + env settings
-  features/           Indicator pipeline (no look-ahead)
-  strategies/         trend_pullback_v1
-  scanner/            Eligibility + opportunity ranking
-  data/               MarketDataPort, mock, scenarios, historical
-  llm/                OllamaClient (fail-closed) + MockLlm + schema
+  execution/          IDs, ExecutionEngine, reconcile, demo pipeline
   risk/               RiskEngine (boss)
-  journal/            SQLite JournalDB
-research/
-  costs.py            Spread / commission / slippage / swap
-  backtest.py         Offline simulator + reports
+  llm/                Ollama + MockLlm
+  scanner/ strategies/ features/ data/ journal/
 config/default.yaml
-migrations/001_initial.sql … 003_llm_decisions.sql
+migrations/001…004_orders_fills.sql
 tests/
 ```
 
-## Phase 5 scope
+## Phase 6 scope
 
 **In**
 
-- Ollama client → `OLLAMA_BASE_URL` / config default `http://192.168.8.22:11434`
-- Primary model `qwen3.8:27b`; optional `qwen3.5:9b` screen
-- Strict JSON schema; unknown fields / bad enums rejected
-- Timeouts and HTTP errors → `REJECT` (fail closed; no trade boost)
-- Journal: prompt version, model, input hash, raw + validated response
-- `risk_modifier` only reduces size; RiskEngine remains boss
-- Optional `scan --analyze` and `trader analyze` dry-run CLI
-- Offline mocks for CI
+- Real `Mt5Broker` via MetaTrader5 when available; graceful fail off Windows / terminal down
+- Idempotent client order IDs; SL/TP required
+- Reconcile broker positions vs journal (unexpected → lock new trades)
+- `broker.mode=demo`; refuse live unless explicitly allowed later (P9)
+- `trader execute-demo` dry-run by default; `--submit` only with `--confirm-demo`
+- Wire: scan/strategy → risk → optional analyze → demo execute
+- Journal orders / fills / positions; offline mock tests green
 
-**Out (later phases)**
+**Out**
 
-- Demo/live MT5 order lifecycle (P6+)
+- Live/real-money trading (P9)
 - Dashboard / kill-switch API (P7)
-- Paper soak / live pilot (P8–P9)
+- Unattended paper soak (P8)
 
 ## Safety
 
-- Fail closed when Ollama is down, times out, or returns bad JSON
+- Fail closed on broker disconnect, unexpected positions, risk locks, LLM errors
 - `risk_modifier` may only **reduce** size
 - No martingale / averaging down
-- No live order CLI
+- No live order path by default
 - Do not optimize for a fixed daily dollar target

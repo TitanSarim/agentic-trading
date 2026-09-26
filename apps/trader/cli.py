@@ -1,7 +1,6 @@
-"""Trader CLI — health, migrate, download-bars, backtest, scan, analyze, ollama-tags.
+"""Trader CLI — health, migrate, download-bars, backtest, scan, analyze, execute-demo.
 
-No live order placement. Backtests/scans/analyze-mock are offline (cloud-safe).
-Live Ollama calls are optional and skippable without LAN.
+Demo execution is dry-run by default. Live (real-money) path is disabled in P6.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ from research.costs import CostConfig, CostModel
 from trading.config import load_settings
 from trading.data.historical import HistoricalDownloader
 from trading.data.mock import MockMarketData
+from trading.execution.pipeline import run_demo_pipeline
 from trading.journal.db import JournalDB
 from trading.llm.factory import create_llm
 from trading.llm.pipeline import analyze_candidates
@@ -36,7 +36,7 @@ from trading.types import Timeframe
 
 app = typer.Typer(
     name="trader",
-    help="Agentic trading CLI (Phase 5 Qwen/Ollama). No live trades.",
+    help="Agentic trading CLI (Phase 6 demo execution). Live path disabled.",
     add_completion=False,
 )
 console = Console()
@@ -89,7 +89,9 @@ def health(ctx: typer.Context) -> None:
         f"[bold]universe[/bold]: {settings.universe.symbols} @ {settings.universe.timeframes}"
     )
     console.print(f"[bold]broker.backend[/bold]: {settings.broker.backend}")
+    console.print(f"[bold]broker.mode[/bold]: {settings.broker.mode}")
     console.print(f"[bold]account_mode[/bold]: {settings.mt5.account_mode}")
+    console.print(f"[bold]allow_live[/bold]: {settings.execution.allow_live}")
 
     db = JournalDB(settings.database.path)
     applied = db.migrate()
@@ -104,7 +106,8 @@ def health(ctx: typer.Context) -> None:
         if settings.broker.backend == "mt5":
             console.print(
                 "[yellow]broker[/yellow]: mt5 selected — connect requires Windows + "
-                "MetaTrader5; skipping live connect in health (use mock in CI)"
+                "MetaTrader5 + running terminal64.exe; skipping live connect in health "
+                "(use mock in CI; trader execute-demo --backend mt5 on Windows)"
             )
         else:
             broker.connect()
@@ -136,6 +139,10 @@ def health(ctx: typer.Context) -> None:
         f"fail_closed={settings.ollama.fail_closed_on_error} "
         "(risk_modifier may only reduce size)"
     )
+    console.print(
+        "[bold]execution[/bold]: demo path available "
+        f"(allow_live={settings.execution.allow_live}; dry-run default)"
+    )
 
     llm = create_llm(settings)
     reachable = llm.health()
@@ -150,13 +157,18 @@ def health(ctx: typer.Context) -> None:
 
     db.record_system_event(
         "health_complete",
-        {"ok": ok, "ollama_reachable": reachable, "broker": settings.broker.backend},
+        {
+            "ok": ok,
+            "ollama_reachable": reachable,
+            "broker": settings.broker.backend,
+            "broker_mode": settings.broker.mode,
+        },
     )
     db.close()
 
     if not ok:
         raise typer.Exit(code=1)
-    console.print("[green]health ok[/green] (Phase 5 Qwen/Ollama)")
+    console.print("[green]health ok[/green] (Phase 6 demo execution)")
 
 
 @app.command("ollama-tags")
@@ -330,6 +342,151 @@ def demo_roundtrip(ctx: typer.Context) -> None:
             "order": result.model_dump() if result else None,
         }
     )
+
+
+@app.command("execute-demo")
+def execute_demo(
+    ctx: typer.Context,
+    symbol: str = typer.Option("EURUSD", "--symbol", "-s"),
+    timeframe: str = typer.Option("M5", "--timeframe", "-t"),
+    bars: int = typer.Option(120, "--bars", "-n"),
+    submit: bool = typer.Option(
+        False,
+        "--submit/--dry-run",
+        help="Actually submit to broker. Default is dry-run (no order sent).",
+    ),
+    confirm_demo: bool = typer.Option(
+        False,
+        "--confirm-demo",
+        help="Required with --submit to acknowledge IC Markets DEMO account.",
+    ),
+    analyze: bool = typer.Option(
+        True,
+        "--analyze/--no-analyze",
+        help="Run mock/config LLM analyst before risk (advisory).",
+    ),
+    live_llm: bool = typer.Option(
+        False,
+        "--live-llm/--mock-llm",
+        help="With analyze: call real Ollama (LAN). Default mock is CI-safe.",
+    ),
+    backend: Optional[str] = typer.Option(
+        None,
+        "--backend",
+        help="Override broker backend for this run: mock | mt5",
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable JSON"),
+) -> None:
+    """Demo execution path: scan → strategy → risk → (optional) analyze → execute.
+
+    Default is **dry-run** (plan only). To place a demo order on Windows::
+
+        trader execute-demo --backend mt5 --submit --confirm-demo
+
+    Never places live/real-money orders in P6 (``execution.allow_live=false``).
+    """
+    settings = ctx.obj["settings"]
+    if timeframe not in ("M5", "M15"):
+        console.print("[red]timeframe must be M5 or M15[/red]")
+        raise typer.Exit(code=1)
+
+    if backend is not None:
+        if backend not in ("mock", "mt5"):
+            console.print("[red]backend must be mock or mt5[/red]")
+            raise typer.Exit(code=1)
+        settings = settings.model_copy(
+            update={"broker": settings.broker.model_copy(update={"backend": backend})}
+        )
+
+    if settings.broker.mode != "demo" and settings.mt5.account_mode != "demo":
+        console.print(
+            "[red]execute-demo refuses non-demo account_mode[/red]. "
+            "Set broker.mode=demo / mt5.account_mode=demo."
+        )
+        raise typer.Exit(code=1)
+
+    if submit and not confirm_demo:
+        console.print(
+            "[red]--submit requires --confirm-demo[/red] "
+            "(acknowledge IC Markets DEMO account)."
+        )
+        raise typer.Exit(code=1)
+
+    if submit and settings.execution.allow_live and settings.broker.mode == "live":
+        console.print(
+            "[red]Live trading path is out of scope for execute-demo (P9).[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    db = JournalDB(settings.database.path)
+    db.migrate()
+    broker = create_broker(settings)
+    llm = None
+    if analyze:
+        llm = create_llm(settings, force_mock=not live_llm)
+        if live_llm and not llm.health():
+            console.print(
+                f"[yellow]Ollama unreachable[/yellow] at {settings.ollama.base_url} — "
+                "use --mock-llm or fix LAN."
+            )
+            raise typer.Exit(code=2)
+
+    try:
+        result = run_demo_pipeline(
+            settings,
+            broker=broker,
+            db=db,
+            llm=llm,
+            symbol=symbol,
+            timeframe=timeframe,
+            bars=bars,
+            submit=submit,
+            confirm_demo=confirm_demo,
+            analyze=analyze,
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]execute-demo failed[/red]: {exc}")
+        db.record_system_event("execute_demo_error", {"error": str(exc)})
+        db.close()
+        raise typer.Exit(code=1) from exc
+    finally:
+        if broker.is_connected():
+            broker.disconnect()
+
+    payload = result.to_dict()
+    db.close()
+
+    if json_out:
+        console.print_json(data=payload)
+    else:
+        console.print(
+            f"[bold]execute-demo[/bold] mode={result.mode} "
+            f"backend={settings.broker.backend} account={result.account_mode}"
+        )
+        console.print(f"message: {result.message}")
+        if result.execution is not None:
+            order = result.execution.order
+            console.print(
+                f"order: dry_run={result.execution.dry_run} "
+                f"submitted={result.execution.submitted} "
+                f"status={order.status.value if order else None} "
+                f"cid={result.execution.plan.client_order_id}"
+            )
+        console.print(
+            "[dim]P6 demo only — no live/real-money path. "
+            "RiskEngine is final authority; Qwen only reduces size.[/dim]"
+        )
+
+    # Non-zero if submit was requested but nothing was submitted successfully.
+    if submit and (
+        result.execution is None
+        or not result.execution.submitted
+        or (
+            result.execution.order
+            and result.execution.order.status.value == "REJECTED"
+        )
+    ):
+        raise typer.Exit(code=1)
 
 
 @app.command("analyze")
